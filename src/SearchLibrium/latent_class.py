@@ -1,0 +1,4190 @@
+import numpy as np
+from scipy.optimize import minimize, differential_evolution
+from scipy.special import logsumexp
+from scipy.stats import norm as _scipy_norm
+import time
+
+try:  
+    from _choice_model import  DiscreteChoiceModel
+    from separation_screen import (
+        is_degenerate_candidate, collinearity_diag, cluster_stability_report,
+        konis_separation_test, attribute_separation,sign_breakdown,
+    )
+   
+    
+except ImportError:    
+    from ._choice_model import DiscreteChoiceModel
+    from .separation_screen import (
+        is_degenerate_candidate, collinearity_diag, cluster_stability_report,
+        konis_separation_test, attribute_separation,sign_breakdown,
+    )
+   
+    
+
+
+
+def _pval_str(pv: float) -> str:
+    if pv < 0.001:
+        return "< 0.001"
+    return f"{pv:.4f}"
+
+
+def _sig_stars(pv: float) -> str:
+    if pv < 0.001:
+        return "***"
+    if pv < 0.01:
+        return " **"
+    if pv < 0.05:
+        return "  *"
+    if pv < 0.1:
+        return "  ."
+    return ""
+
+
+class LatentClassMixedLogit(DiscreteChoiceModel):
+    """Fast latent-class discrete choice model with optional JAX acceleration.
+
+    Supports both fixed class shares and a membership equation
+    (``membership_vars``) that uses individual-level covariates to
+    predict class assignment via a multinomial logit parameterisation.
+    """
+
+    def __init__(
+        self,
+        n_classes=2,
+        maxiter=500,
+        class_maxiter=500,
+        tol=1e-6,
+        random_state=0,
+        _jax=True,
+        n_init=1,
+        optimise_membership=True,
+        membership_maxiter=500,
+        l1_penalty=0.0,
+        l2_penalty=0.5,
+    ):
+        self.n_classes = int(n_classes)
+        self.maxiter = int(maxiter)
+        self.class_maxiter = int(class_maxiter)
+        self.tol = float(tol)
+        self.random_state = int(random_state)
+        self.n_init = max(1, int(n_init))
+        self.optimise_membership = bool(optimise_membership)
+        self.membership_maxiter = int(membership_maxiter)
+        self.l1_penalty = float(l1_penalty)
+        self.l2_penalty = float(l2_penalty)
+        self.descr = "LC-MXL"
+        self.coeff_est = None
+        self.coeff_names = None
+        self.stderr = None
+        self.zvalues = None
+        self.pvalues = None
+        self.pvalues_member = None
+        self.class_betas = None
+        self.class_probs = None
+        self.class_gammas = None
+        self.posterior = None
+        self.loglik = None
+        self.loglik_null = None
+        self.aic = None
+        self.bic = None
+        self.converged = False
+        self.total_iter = 0
+        self.num_params = None
+        self.search_results = None
+        self._jax = bool(_jax)
+        self._jax_enabled = False
+
+        if self._jax:
+            try:
+                import jax
+                import jax.numpy as jnp
+                from jax import lax
+                from jax import jit, value_and_grad
+                from jax.scipy.special import logsumexp as jax_logsumexp
+
+                jax.config.update("jax_enable_x64", True)
+                self.jax = jax
+                self.jnp = jnp
+                self.jit = jit
+                self.value_and_grad = value_and_grad
+                self.jax_logsumexp = jax_logsumexp
+                self._jax_enabled = True
+            except ImportError:
+                self._jax = False
+
+    def setup(self, X, y, varnames, ids, alts, avail=None, fit_intercept=False,
+              membership_vars=None, member_params_spec=None, base_class=None,
+              class_params_spec=None, l1_penalty=None, l2_penalty=None):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        ids = np.asarray(ids)
+        alts = np.asarray(alts)
+        varnames = list(varnames)
+
+        if fit_intercept and "intercept" not in varnames:
+            X = np.column_stack([np.ones(X.shape[0]), X])
+            varnames = ["intercept"] + varnames
+
+        if avail is None:
+            avail = np.ones_like(y, dtype=float)
+        else:
+            avail = np.asarray(avail, dtype=float)
+
+        _, first_idx = np.unique(alts, return_index=True)
+        self.alts = alts[np.sort(first_idx)]
+        self.J = len(self.alts)
+        self.K = X.shape[1]
+        self.varnames = varnames
+        if l1_penalty is not None:
+            self.l1_penalty = float(l1_penalty)
+        if l2_penalty is not None:
+            self.l2_penalty = float(l2_penalty)
+
+        order = np.lexsort((alts, ids))
+        X = X[order]
+        y = y[order]
+        ids = ids[order]
+        avail = avail[order]
+
+        unique_ids, counts = np.unique(ids, return_counts=True)
+        if np.any(counts != self.J):
+            raise ValueError("LatentClassMixedLogit requires balanced long-format data by choice id.")
+
+        self.ids = unique_ids
+        self.N = len(unique_ids)
+        self.X = X.reshape(self.N, self.J, self.K)
+        self.y = y.reshape(self.N, self.J)
+        self.avail = avail.reshape(self.N, self.J)
+        self.sample_size = self.N
+
+        # ── Class-specific specification ────────────────────────────────────
+        self._class_specs = None
+        self._Ks = None  # K per class
+
+        _member_util_exclude = set()
+        if membership_vars is not None:
+            for v in membership_vars:
+                if v in varnames:
+                    _member_util_exclude.add(varnames.index(v))
+        elif member_params_spec is not None:
+            flat_members = []
+            for arr in member_params_spec:
+                flat_members.extend(list(arr))
+            for v in flat_members:
+                if isinstance(v, str) and v != '_inter' and v in varnames:
+                    _member_util_exclude.add(varnames.index(v))
+
+        if class_params_spec is not None:
+            self._class_specs = []
+            self._Ks = []
+            for c, spec in enumerate(class_params_spec):
+                indices = []
+                for v in spec:
+                    if v in varnames:
+                        indices.append(varnames.index(v))
+                    elif v == '_inter' and 'intercept' in varnames:
+                        indices.append(varnames.index('intercept'))
+                    elif v != '_inter':
+                        raise ValueError(
+                            f"Class {c} variable '{v}' not found in varnames."
+                        )
+                self._class_specs.append(np.array(indices, dtype=int))
+                self._Ks.append(len(indices))
+            
+            self._class_specs = self._class_specs
+            self._Ks = np.array(self._Ks, dtype=int)
+            self.K_tot = int(self._Ks.sum())
+        else:
+            if _member_util_exclude:
+                utility_idx = [i for i in range(self.K) if i not in _member_util_exclude]
+                self._Ks = np.full(self.n_classes, len(utility_idx), dtype=int)
+                self._class_specs = [np.array(utility_idx, dtype=int)] * self.n_classes
+                self.K_tot = self.n_classes * len(utility_idx)
+            else:
+                self._Ks = np.full(self.n_classes, self.K, dtype=int)
+                self._class_specs = [np.arange(self.K, dtype=int)] * self.n_classes
+                self.K_tot = self.n_classes * self.K
+
+        # ── Membership data — dense (C, Km) gamma + mask; base_class fixed,
+        # configurable. Intercept kept separate (free for C-1 non-base
+        # classes only); covariates free per (class, var) via the mask. ─────
+        self._has_membership = False
+        self.X_membership = None
+        self.K_membership = 0
+        self._member_mask = None          # (C, Km) 0/1
+        self.membership_vars = None
+        self.member_params_spec = None
+
+        self.base_class = base_class if base_class is not None else self.n_classes - 1
+        self._intercept_free_classes = [c for c in range(self.n_classes) if c != self.base_class]
+
+        if member_params_spec is not None:
+            self._has_membership = True
+            self.member_params_spec = member_params_spec
+
+            covariate_vars = sorted({v for arr in member_params_spec for v in arr if v != '_inter'})
+            self.membership_vars = covariate_vars
+            self.K_membership = len(covariate_vars)
+
+            membership_indices = []
+            for v in covariate_vars:
+                if v in varnames:
+                    membership_indices.append(varnames.index(v))
+                else:
+                    raise ValueError(f"Membership variable '{v}' not found in varnames.")
+
+            mem_data = X[:, membership_indices] if membership_indices else None
+            self.X_membership = np.zeros((self.N, self.K_membership))
+            if mem_data is not None:
+                for n in range(self.N):
+                    self.X_membership[n, :] = mem_data[n * self.J]
+
+            var_to_col = {v: i for i, v in enumerate(covariate_vars)}
+            self._member_mask = np.zeros((self.n_classes, self.K_membership))
+            for c in range(self.n_classes):
+                spec = member_params_spec[c] if c < len(member_params_spec) else []
+                for v in spec:
+                    if v != '_inter' and v in var_to_col:
+                        self._member_mask[c, var_to_col[v]] = 1.0
+
+        self._prepare_backend_arrays()
+        self._prepare_membership_backend()
+        return self
+
+    def _prepare_backend_arrays(self):
+        if self._jax_enabled:
+            self.X_backend = self.jnp.asarray(self.X)
+            self.y_backend = self.jnp.asarray(self.y)
+            self.avail_backend = self.jnp.asarray(self.avail)
+        else:
+            self.X_backend = self.X
+            self.y_backend = self.y
+            self.avail_backend = self.avail
+
+    def _prepare_membership_backend(self):
+        if self.X_membership is not None:
+            if self._jax_enabled:
+                self.X_memb_backend = self.jnp.asarray(self.X_membership)
+            else:
+                self.X_memb_backend = self.X_membership
+        else:
+            self.X_memb_backend = None
+
+    def _regularize_l2_betas(self, betas):
+        if isinstance(betas, list):
+            return self.l2_penalty * sum(float(np.sum(np.square(np.asarray(b)))) for b in betas)
+        return self.l2_penalty * float(np.sum(np.square(np.asarray(betas))))
+
+    def _regularize_l1_betas(self, betas):
+        if isinstance(betas, list):
+            return self.l1_penalty * sum(float(np.sum(np.abs(np.asarray(b)))) for b in betas)
+        return self.l1_penalty * float(np.sum(np.abs(np.asarray(betas))))
+
+    def _regularize_l2_gammas(self, gammas):
+        if gammas is None or self.l2_penalty == 0:
+            return 0.0
+        return self.l2_penalty * float(np.sum(np.square(np.asarray(gammas))))
+
+    def _regularize_l1_gammas(self, gammas):
+        if gammas is None or self.l1_penalty == 0:
+            return 0.0
+        return self.l1_penalty * float(np.sum(np.abs(np.asarray(gammas))))
+
+    def _regularize_l1_grad(self, beta):
+        return self.l1_penalty * np.sign(np.asarray(beta, dtype=float))
+
+    @staticmethod
+    def _normalize_class_probs(class_probs):
+        class_probs = np.clip(np.asarray(class_probs, dtype=float), 1e-12, None)
+        return class_probs / class_probs.sum()
+
+    def _compute_membership_priors(self, class_intercepts, gamma_covariates):
+
+        """Compute individual-level class priors from the membership equation.
+
+        Parameters
+        ----------
+        class_intercepts : ndarray, shape (n_classes - 1,)
+            Free intercept per non-base class, in `self._intercept_free_classes`
+            order. `self.base_class` has an implicit intercept of 0 (fixed).
+        gamma_covariates : ndarray, shape (n_classes, K_membership) or flat
+            Per-class covariate coefficients; masked by `self._member_mask`
+            before use, so entries outside a class's spec never contribute.
+
+        Returns
+        -------
+        priors : ndarray, shape (N, C)
+        """
+        C = self.n_classes
+        if not self._has_membership or self.X_membership is None:
+            return np.tile(np.full(C, 1.0 / C), (self.N, 1))
+
+        gamma_covariates = np.asarray(gamma_covariates, dtype=float)
+        if gamma_covariates.ndim == 1:
+            gamma_covariates = gamma_covariates.reshape(C, self.K_membership)
+        gamma_masked = gamma_covariates * self._member_mask
+
+        logits = np.zeros((self.N, C))
+        for i, c in enumerate(self._intercept_free_classes):
+            logits[:, c] = class_intercepts[i]
+        logits += self.X_membership @ gamma_masked.T
+
+        logits -= logits.max(axis=1, keepdims=True)
+        exp_logits = np.exp(logits)
+        priors = exp_logits / np.clip(exp_logits.sum(axis=1, keepdims=True), 1e-300, None)
+
+        return priors
+
+    def _membership_loglik_and_grad(self, params, weights):
+
+        """Negative log-likelihood and gradient for the membership M-step.
+
+        Parameters
+        ----------
+        params : ndarray, shape (n_inter + n_classes*K_membership,)
+            Flattened [class_intercepts (C-1,) | gamma_covariates (C*Km,)].
+        weights : ndarray, shape (N, C)
+            Posterior probabilities from the E-step.
+
+        Returns
+        -------
+        neg_ll : float
+        grad : ndarray, same shape as `params`
+        """
+        C = self.n_classes
+        Km = self.K_membership
+        n_inter = len(self._intercept_free_classes)
+        class_intercepts = params[:n_inter]
+        gamma_covariates = params[n_inter:].reshape(C, Km)
+
+        priors = self._compute_membership_priors(class_intercepts, gamma_covariates)
+        log_priors = np.log(np.clip(priors, 1e-300, None))
+        ll = np.sum(weights * log_priors)
+
+        residuals = weights - priors
+        grad_intercepts = np.array([residuals[:, c].sum() for c in self._intercept_free_classes])
+        gamma_masked = gamma_covariates * self._member_mask
+        grad_gamma = (self.X_membership.T @ residuals).T * self._member_mask
+
+        l2 = self.l2_penalty
+        l1 = self.l1_penalty
+        if l2 > 0:
+            ll -= l2 * (np.sum(np.square(class_intercepts)) + np.sum(np.square(gamma_masked)))
+        if l1 > 0:
+            ll -= l1 * (np.sum(np.abs(class_intercepts)) + np.sum(np.abs(gamma_masked)))
+
+        neg_grad_intercepts = -grad_intercepts
+        neg_grad_gamma = -grad_gamma
+        if l2 > 0:
+            neg_grad_intercepts += 2.0 * l2 * class_intercepts
+            neg_grad_gamma += 2.0 * l2 * gamma_masked
+        if l1 > 0:
+            neg_grad_intercepts += l1 * np.sign(class_intercepts)
+            neg_grad_gamma += l1 * np.sign(gamma_masked)
+
+        neg_grad = np.concatenate([neg_grad_intercepts, neg_grad_gamma.flatten()])
+
+        return -ll, neg_grad
+
+    def _membership_m_step(self, params0, weights):
+
+        """M-step for membership (intercepts + gamma) parameters.
+
+        Minimises negative weighted log-likelihood of the membership
+        equation using L-BFGS-B.
+        """
+        C = self.n_classes
+        Km = self.K_membership
+        params0 = np.asarray(params0, dtype=float).ravel()
+        if C <= 1 or Km == 0:
+            return params0
+
+        result = minimize(
+            lambda p: self._membership_loglik_and_grad(p, weights),
+            params0,
+            method="L-BFGS-B",
+            jac=True,
+            options={"maxiter": self.membership_maxiter},
+        )
+        return result.x
+
+    def _make_initial_membership_params(self, rng, params0=None):
+
+        """Initialise membership parameters: [class_intercepts | gamma_covariates] flat."""
+
+        C = self.n_classes
+        Km = self.K_membership
+        n_inter = len(self._intercept_free_classes)
+        n_total = n_inter + C * Km
+        if not self._has_membership or n_total == 0:
+            return np.empty(0)
+        if params0 is not None:
+            params0 = np.asarray(params0, dtype=float).ravel()
+            if params0.size == n_total:
+                return params0.copy()
+        intercepts0 = rng.normal(scale=0.01, size=n_inter)
+        gamma0 = rng.normal(scale=0.01, size=C * Km)
+
+        return np.concatenate([intercepts0, gamma0])
+
+    def _split_membership_params(self, params):
+
+        """Split flat membership params into (class_intercepts, gamma_covariates)."""
+        
+        n_inter = len(self._intercept_free_classes)
+        class_intercepts = params[:n_inter]
+        gamma_covariates = params[n_inter:].reshape(self.n_classes, self.K_membership)
+        return class_intercepts, gamma_covariates
+
+    def _choice_probs_np(self, beta):
+        utilities = np.einsum("njk,k->nj", self.X, beta)
+        utilities = np.where(self.avail > 0, utilities, -1e10)
+        utilities = utilities - utilities.max(axis=1, keepdims=True)
+        exp_u = np.exp(utilities) * self.avail
+        denom = np.clip(exp_u.sum(axis=1, keepdims=True), 1e-300, None)
+        return exp_u / denom
+
+    def _choice_probs_one_class(self, beta_c, c):
+        idx = self._class_specs[c]
+        X_c = self.X[:, :, idx]
+        utilities = X_c @ beta_c
+        utilities = np.where(self.avail > 0, utilities, -1e10)
+        utilities = utilities - utilities.max(axis=1, keepdims=True)
+        exp_u = np.exp(utilities) * self.avail
+        return exp_u / np.clip(exp_u.sum(axis=1, keepdims=True), 1e-300, None)
+
+    def _choice_probs_all_np(self, betas):
+        if not isinstance(betas, (list, np.ndarray)):
+            betas = [betas]
+        probs = np.zeros((self.N, self.n_classes, self.J))
+        for c in range(self.n_classes):
+            idx = self._class_specs[c]
+            bc = np.asarray(betas[c], dtype=float)
+            X_c = self.X[:, :, idx]
+            utilities = X_c @ bc
+            utilities = np.where(self.avail > 0, utilities, -1e10)
+            utilities = utilities - utilities.max(axis=1, keepdims=True)
+            exp_u = np.exp(utilities) * self.avail
+            probs[:, c, :] = exp_u / np.clip(exp_u.sum(axis=1, keepdims=True), 1e-300, None)
+        return probs
+
+    def _choice_probs(self, beta):
+        return self._choice_probs_np(np.asarray(beta, dtype=float))
+
+    def _log_choice_probs_np(self, betas):
+        probs = self._choice_probs_all_np(betas)
+        chosen_prob = np.clip((probs * self.y[:, None, :]).sum(axis=2), 1e-300, None)
+        return np.log(chosen_prob), probs
+
+    def _build_jax_full_objective(self):
+        cache_key = "_jax_full_obj"
+        if hasattr(self, cache_key):
+            return getattr(self, cache_key)
+
+        if not self._jax_enabled or len(set(self._Ks)) != 1:
+            setattr(self, cache_key, None)
+            return None
+
+        jnp = self.jnp
+        C = self.n_classes
+        K = int(self._Ks[0])
+        n_phi = C - 1
+        avail = self.avail_backend
+        y_b = self.y_backend
+        X_full = self.X_backend
+        util_spec = self._class_specs[0] if self._class_specs is not None else None
+        if util_spec is not None and len(util_spec) < X_full.shape[2]:
+            X_b = X_full[:, :, util_spec]
+        else:
+            X_b = X_full
+        N = int(X_b.shape[0])
+        has_memb = bool(self._has_membership and self.optimise_membership
+                        and self.K_membership > 0)
+        Km = self.K_membership if has_memb else 0
+        X_memb = self.X_memb_backend if has_memb else None
+        l2 = self.l2_penalty
+        l1 = self.l1_penalty
+
+        def _negloglik_flat(params):
+            phi = params[:n_phi]
+            beta_flat = params[n_phi:n_phi + C * K]
+            betas = beta_flat.reshape(C, K)
+
+            utilities = jnp.einsum("ck,njk->ncj", betas, X_b)
+            utilities = jnp.where(avail[:, None, :] > 0, utilities, -1e10)
+            utilities = utilities - jnp.max(utilities, axis=2, keepdims=True)
+            exp_u = jnp.exp(utilities) * avail[:, None, :]
+            denom = jnp.clip(exp_u.sum(axis=2, keepdims=True), 1e-300)
+            probs = exp_u / denom
+            chosen = jnp.clip((probs * y_b[:, None, :]).sum(axis=2), 1e-300)
+            log_chosen = jnp.log(chosen)
+
+            if has_memb:
+                gammas = params[n_phi + C * K:].reshape(C - 1, Km)
+                logits = jnp.zeros((N, C))
+                for c in range(C - 1):
+                    logits = logits.at[:, c].set(X_memb @ gammas[c])
+                logits = logits - jnp.max(logits, axis=1, keepdims=True)
+                exp_logits = jnp.exp(logits)
+                priors = exp_logits / jnp.clip(jnp.sum(exp_logits, axis=1, keepdims=True), 1e-300, None)
+                log_prior = jnp.log(jnp.clip(priors, 1e-300))
+            else:
+                phi_full = jnp.concatenate([phi, jnp.zeros(1)])
+                log_priors_raw = phi_full - self.jax_logsumexp(phi_full)
+                log_prior = jnp.broadcast_to(log_priors_raw[None, :], (N, C))
+
+            log_joint = log_chosen + log_prior
+            log_marg = self.jax_logsumexp(log_joint, axis=1)
+            ll = jnp.sum(log_marg)
+            ll -= l2 * jnp.sum(jnp.square(betas))
+            ll -= l1 * jnp.sum(jnp.abs(betas))
+            if has_memb:
+                ll -= l2 * jnp.sum(jnp.square(gammas))
+                ll -= l1 * jnp.sum(jnp.abs(gammas))
+            return -ll
+
+        obj, grad_fn = None, None
+        try:
+            obj = self.jit(_negloglik_flat)
+            grad_fn = self.jit(self.value_and_grad(_negloglik_flat))
+        except Exception:
+            pass
+
+        cached = (obj, grad_fn)
+        setattr(self, cache_key, cached)
+        return cached
+
+    def _build_jax_weighted_objective(self, X_c=None, class_idx=None):
+        if X_c is None:
+            cache_key = "_full"
+        else:
+            cache_key = "_c" + str(class_idx) + "_k" + str(X_c.shape[2])
+
+        cache_attr = "_jax_wobj" + cache_key
+        cache_grad  = "_jax_wobj_grad" + cache_key
+
+        if hasattr(self, cache_attr):
+            return getattr(self, cache_attr)
+
+        jnp = self.jnp
+        X = self.jnp.asarray(X_c) if X_c is not None else self.X_backend
+        y = self.y_backend
+        avail = self.avail_backend
+
+        @self.jit
+        def objective(beta, weights):
+            utilities = jnp.einsum("njk,k->nj", X, beta)
+            utilities = jnp.where(avail > 0, utilities, -1e10)
+            utilities = utilities - jnp.max(utilities, axis=1, keepdims=True)
+            exp_u = jnp.exp(utilities) * avail
+            probs = exp_u / jnp.clip(jnp.sum(exp_u, axis=1, keepdims=True), 1e-300)
+            chosen_prob = jnp.clip(jnp.sum(probs * y, axis=1), 1e-300)
+            loglik = jnp.sum(weights * jnp.log(chosen_prob))
+            return -loglik
+
+        setattr(self, cache_attr, objective)
+        setattr(self, cache_grad, self.jit(self.value_and_grad(objective)))
+        return objective
+
+    def _weighted_m_step(self, beta0, weights, class_idx=None):
+        """Weighted M-step for a single class's betas."""
+        weights = np.asarray(weights, dtype=float)
+
+        if class_idx is not None and self._class_specs is not None:
+            X_c = self.X[:, :, self._class_specs[class_idx]]
+        else:
+            X_c = self.X
+
+        use_jax = self._jax_enabled
+
+        if use_jax:
+            self._build_jax_weighted_objective(
+                X_c if class_idx is not None else None,
+                class_idx=class_idx
+            )
+            weights_backend = self.jnp.asarray(weights)
+
+            if class_idx is not None:
+                cache_key = "_c" + str(class_idx) + "_k" + str(X_c.shape[2])
+            else:
+                cache_key = "_full"
+            grad_fn = getattr(self, "_jax_wobj_grad" + cache_key)
+
+            def objective(beta):
+                value, grad = grad_fn(self.jnp.asarray(beta), weights_backend)
+                l2 = self.l2_penalty * float(self.jnp.sum(self.jnp.square(beta)))
+                l1 = self.l1_penalty * float(self.jnp.sum(self.jnp.abs(beta)))
+                grad_l1 = self._regularize_l1_grad(np.asarray(beta))
+                return float(value) + l2 + l1, np.asarray(grad, dtype=float) + 2.0 * self.l2_penalty * np.asarray(beta) + grad_l1
+        else:
+            def objective(beta):
+                utilities = np.einsum("njk,k->nj", X_c, beta)
+                utilities = np.where(self.avail > 0, utilities, -1e10)
+                utilities = utilities - utilities.max(axis=1, keepdims=True)
+                exp_u = np.exp(utilities) * self.avail
+                probs = exp_u / np.clip(exp_u.sum(axis=1, keepdims=True), 1e-300, None)
+                chosen_prob = np.clip((probs * self.y).sum(axis=1), 1e-300, None)
+                loglik = np.sum(weights * np.log(chosen_prob))
+                diff = (self.y - probs) * weights[:, None]
+                grad = np.einsum("nj,njk->k", diff, X_c)
+                l2 = self.l2_penalty * float(np.sum(beta * beta))
+                l1 = self.l1_penalty * float(np.sum(np.abs(beta)))
+                return -loglik + l2 + l1, -grad + 2.0 * self.l2_penalty * beta + self._regularize_l1_grad(beta)
+
+        result = minimize(
+            objective,
+            np.asarray(beta0, dtype=float),
+            method="L-BFGS-B",
+            jac=True,
+            options={"maxiter": self.class_maxiter},
+        )
+        return result.x
+
+    def _de_warm_start(
+        self,
+        popsize=6,
+        maxiter=20,
+        tol=0.01,
+        seed=None,
+        bounds_scale=5.0,
+    ):
+        """Differential Evolution warm-start for EM betas.
+
+        Minimises the negative marginal log-likelihood over the flattened
+        beta parameters.  Uses JAX for the objective if enabled, otherwise
+        falls back to the numpy path.
+
+        Returns
+        -------
+        betas0 : list of ndarrays, one per class, or ndarray shape (n_classes, K)
+        """
+        n_params = sum(self._Ks)
+        bounds = [(-bounds_scale, bounds_scale)] * n_params
+
+        if self._jax_enabled and len(set(self._Ks)) == 1:
+            jnp = self.jnp
+            X_b = self.X_backend
+            y_b = self.y_backend
+            av_b = self.avail_backend
+            C = self.n_classes
+            K_util = int(self._Ks[0])
+            util_spec = self._class_specs[0] if self._class_specs is not None else None
+
+            if util_spec is not None and len(util_spec) < self.K:
+                X_util = X_b[:, :, util_spec]
+            else:
+                X_util = X_b
+
+            @self.jit
+            def _jax_negll(betas_flat):
+                betas = betas_flat.reshape(C, K_util)
+                utilities = jnp.einsum("ck,njk->ncj", betas, X_util)
+                utilities = jnp.where(av_b[:, None, :] > 0, utilities, -1e10)
+                utilities = utilities - jnp.max(utilities, axis=2, keepdims=True)
+                exp_u = jnp.exp(utilities) * av_b[:, None, :]
+                denom = jnp.clip(exp_u.sum(axis=2, keepdims=True), 1e-300)
+                probs = exp_u / denom
+                chosen = jnp.clip((probs * y_b[:, None, :]).sum(axis=2), 1e-300)
+                log_chosen = jnp.log(chosen)
+                log_prior = jnp.log(jnp.full(C, 1.0 / C))
+                log_joint = log_chosen + log_prior[None, :]
+                log_marg = self.jax_logsumexp(log_joint, axis=1)
+                ll = jnp.sum(log_marg)
+                l2 = self.l2_penalty * jnp.sum(jnp.square(betas))
+                l1 = self.l1_penalty * jnp.sum(jnp.abs(betas))
+                return -(ll - l2 - l1)
+
+            def _obj(betas_np):
+                return float(_jax_negll(jnp.array(betas_np, dtype=jnp.float64)))
+
+        else:
+            def _obj(betas_np):
+                betas = []
+                offset = 0
+                for k in self._Ks:
+                    betas.append(betas_np[offset:offset + k])
+                    offset += k
+                log_choice, _ = self._log_choice_probs_np(betas)
+                log_prior = np.log(np.full(self.n_classes, 1.0 / self.n_classes))
+                log_joint = log_choice + log_prior[None, :]
+                log_marg = logsumexp(log_joint, axis=1)
+                ll = float(log_marg.sum())
+                ll -= self._regularize_l2_betas(betas)
+                ll -= self._regularize_l1_betas(betas)
+                return -ll
+
+        K_flat = sum(self._Ks)
+        print(
+            f"[LC-DE] Running DE: classes={self.n_classes}, K={K_flat}, "
+            f"popsize={popsize}, maxiter={maxiter}, jax={self._jax_enabled}"
+        )
+        result = differential_evolution(
+            _obj,
+            bounds,
+            popsize=popsize,
+            maxiter=maxiter,
+            tol=tol,
+            seed=seed,
+            polish=False,
+        )
+        print(
+            f"[LC-DE] DE done: success={result.success}, "
+            f"negll={result.fun:.4f}, nit={result.nit}"
+        )
+
+        # Return in the format matching the current setup (list or matrix)
+        betas = []
+        offset = 0
+        for k in self._Ks:
+            betas.append(result.x[offset:offset + k])
+            offset += k
+        if len(set(self._Ks)) == 1:
+            betas = np.array(betas)
+        return betas
+
+    def _make_initial_betas(self, rng, betas0=None):
+        if betas0 is not None:
+            if isinstance(betas0, list):
+                return [np.asarray(b, dtype=float) for b in betas0]
+            betas0 = np.asarray(betas0, dtype=float)
+            if betas0.shape == (self.n_classes, self.K):
+                return [betas0[c, self._class_specs[c]].copy() for c in range(self.n_classes)]
+            return [b.copy() for b in betas0]
+        return [rng.normal(scale=0.05, size=k) for k in self._Ks]
+
+    def _make_initial_class_probs(self, class_probs0=None):
+        if class_probs0 is None:
+            return np.full(self.n_classes, 1.0 / self.n_classes)
+        if len(class_probs0) != self.n_classes:
+            raise ValueError("class_probs0 must have length n_classes.")
+        return self._normalize_class_probs(class_probs0)
+
+    def _em_step(self, betas, class_probs, membership_params=None):
+
+        """Single E+M step. Returns (new_betas, new_class_probs, new_membership_params, loglik, posterior)."""
+
+        log_choice, _ = self._log_choice_probs_np(betas)
+
+        if self._has_membership and self.optimise_membership and membership_params is not None:
+            ci, gc = self._split_membership_params(membership_params)
+            priors = self._compute_membership_priors(ci, gc)
+        else:
+            priors = np.broadcast_to(class_probs[None, :], (self.N, self.n_classes))
+
+        log_joint = log_choice + np.log(np.clip(priors, 1e-300, None))
+        log_denom = logsumexp(log_joint, axis=1, keepdims=True)
+        posterior = np.exp(log_joint - log_denom)
+        loglik = float(log_denom.sum())
+        loglik -= self._regularize_l2_betas(betas)
+        loglik -= self._regularize_l1_betas(betas)
+        loglik -= self._regularize_l2_gammas(membership_params)
+        loglik -= self._regularize_l1_gammas(membership_params)
+
+        new_class_probs = self._normalize_class_probs(posterior.mean(axis=0))
+
+        new_betas = betas.copy() if isinstance(betas, list) else list(betas)
+        for c in range(self.n_classes):
+            new_betas[c] = self._weighted_m_step(betas[c] if isinstance(betas, list) else betas[c],
+                                                  posterior[:, c], class_idx=c)
+
+        new_membership_params = membership_params
+        if self._has_membership and self.optimise_membership and membership_params is not None and self.K_membership > 0:
+            new_membership_params = self._membership_m_step(membership_params, posterior)
+
+        return new_betas, new_class_probs, new_membership_params, loglik, posterior
+
+    def _squarem_loglik(self, betas, class_probs, membership_params=None):
+
+        """Log-likelihood at (betas, class_probs, membership_params) without running the M-step."""
+
+        log_choice, _ = self._log_choice_probs_np(betas)
+
+        if self._has_membership and self.optimise_membership and membership_params is not None:
+            ci, gc = self._split_membership_params(membership_params)
+            priors = self._compute_membership_priors(ci, gc)
+        else:
+            priors = np.broadcast_to(class_probs[None, :], (self.N, self.n_classes))
+
+        log_joint = log_choice + np.log(np.clip(priors, 1e-300, None))
+        ll = float(logsumexp(log_joint, axis=1).sum())
+        ll -= self._regularize_l2_betas(betas)
+        ll -= self._regularize_l1_betas(betas)
+        ll -= self._regularize_l2_gammas(membership_params)
+        ll -= self._regularize_l1_gammas(membership_params)
+
+        return ll
+
+    def _fit_em_once(self, rng, betas0=None, class_probs0=None, gammas0=None):
+        betas = self._make_initial_betas(rng, betas0=betas0)
+        class_probs = self._make_initial_class_probs(class_probs0=class_probs0)
+        membership_params = self._make_initial_membership_params(rng, params0=gammas0) if self._has_membership else None
+        prev_loglik = -np.inf
+        posterior = np.full((self.N, self.n_classes), 1.0 / self.n_classes)
+        converged = False
+
+        for iteration in range(1, self.maxiter + 1):
+            log_choice, _ = self._log_choice_probs_np(betas)
+
+            if self._has_membership and self.optimise_membership and membership_params is not None:
+                ci, gc = self._split_membership_params(membership_params)
+                priors = self._compute_membership_priors(ci, gc)
+            else:
+                priors = np.broadcast_to(class_probs[None, :], (self.N, self.n_classes))
+
+            log_joint = log_choice + np.log(np.clip(priors, 1e-300, None))
+            log_denom = logsumexp(log_joint, axis=1, keepdims=True)
+            posterior = np.exp(log_joint - log_denom)
+            loglik = float(log_denom.sum())
+            loglik -= self._regularize_l2_betas(betas)
+            loglik -= self._regularize_l1_betas(betas)
+            loglik -= self._regularize_l2_gammas(membership_params)
+            loglik -= self._regularize_l1_gammas(membership_params)
+
+            class_probs = self._normalize_class_probs(posterior.mean(axis=0))
+            for c in range(self.n_classes):
+                bc = betas[c] if isinstance(betas, list) else betas[c]
+                betas[c] = self._weighted_m_step(bc, posterior[:, c], class_idx=c)
+
+            if self._has_membership and self.optimise_membership and membership_params is not None and self.K_membership > 0:
+                membership_params = self._membership_m_step(membership_params, posterior)
+
+            if abs(loglik - prev_loglik) < self.tol:
+                converged = True
+                break
+            prev_loglik = loglik
+
+        return {
+            "betas": betas,
+            "class_probs": class_probs,
+            "gammas": membership_params,
+            "posterior": posterior,
+            "loglik": loglik,
+            "converged": converged,
+            "iterations": iteration,
+        }
+
+    def _fit_squarem_once(self, rng, betas0=None, class_probs0=None, gammas0=None):
+
+        """Fit via SQUAREM-accelerated EM (Varadhan & Roland 2008)."""
+
+        betas = self._make_initial_betas(rng, betas0=betas0)
+        class_probs = self._make_initial_class_probs(class_probs0=class_probs0)
+        membership_params = self._make_initial_membership_params(rng, params0=gammas0) if self._has_membership else None
+
+        n_beta = sum(self._Ks)
+        n_inter = len(self._intercept_free_classes) if self._has_membership else 0
+        n_gamma = (n_inter + self.n_classes * self.K_membership) if self._has_membership else 0
+
+        _do_membership = bool(self._has_membership and self.optimise_membership
+                              and membership_params is not None and self.K_membership > 0)
+
+        def _pack(b, cp, gm):
+            if isinstance(b, list):
+                b_flat = np.concatenate([np.asarray(bi).ravel() for bi in b])
+            else:
+                b_flat = np.asarray(b).ravel()
+            parts = [b_flat, cp]
+            if _do_membership and gm is not None:
+                parts.append(np.asarray(gm).ravel())
+            return np.concatenate(parts)
+
+        def _unpack(theta):
+            offset = 0
+            b = []
+            for k in self._Ks:
+                b.append(theta[offset:offset + k])
+                offset += k
+            cp = self._normalize_class_probs(theta[offset:offset + self.n_classes])
+            offset += self.n_classes
+            if _do_membership:
+                gm = theta[offset:]
+            else:
+                gm = None
+            return b, cp, gm
+
+        theta = _pack(betas, class_probs, membership_params)
+        prev_loglik = -np.inf
+        converged = False
+        posterior = np.full((self.N, self.n_classes), 1.0 / self.n_classes)
+        em_calls = 0
+
+        for outer_iter in range(1, self.maxiter + 1):
+            b0, cp0, gm0 = _unpack(theta)
+
+            b1, cp1, gm1, ll1, _p1 = self._em_step(b0, cp0, gm0)
+            em_calls += 1
+            theta1 = _pack(b1, cp1, gm1)
+
+            b2, cp2, gm2, ll2, post2 = self._em_step(b1, cp1, gm1)
+            em_calls += 1
+            theta2 = _pack(b2, cp2, gm2)
+
+            r = theta1 - theta
+            v = theta2 - 2.0 * theta1 + theta
+            norm_v = np.linalg.norm(v)
+
+            if norm_v < 1e-14:
+                theta = theta2
+                loglik = ll2
+                posterior = post2
+            else:
+                alpha = min(-np.linalg.norm(r) / norm_v, -1.0)
+
+                accepted = False
+                b_p, cp_p, gm_p, ll_p = b2, cp2, gm2, ll2
+                for _ in range(10):
+                    theta_prop = theta - 2.0 * alpha * r + alpha ** 2 * v
+                    b_cand, cp_cand, gm_cand = _unpack(theta_prop)
+                    ll_cand = self._squarem_loglik(b_cand, cp_cand, gm_cand)
+                    if np.isfinite(ll_cand) and ll_cand >= ll1:
+                        b_p, cp_p, gm_p, ll_p = b_cand, cp_cand, gm_cand, ll_cand
+                        accepted = True
+                        break
+                    alpha = (alpha + (-1.0)) / 2.0
+
+                if accepted:
+                    theta = _pack(b_p, cp_p, gm_p)
+                    loglik = ll_p
+                    if _do_membership and gm_p is not None:
+                        ci_p, gc_p = self._split_membership_params(gm_p)
+                        priors = self._compute_membership_priors(ci_p, gc_p)
+                    else:
+                        priors = np.broadcast_to(cp_p[None, :], (self.N, self.n_classes))
+                    log_choice, _ = self._log_choice_probs_np(b_p)
+                    log_joint = log_choice + np.log(np.clip(priors, 1e-300, None))
+                    log_denom = logsumexp(log_joint, axis=1, keepdims=True)
+                    posterior = np.exp(log_joint - log_denom)
+                else:
+                    theta = theta2
+                    loglik = ll2
+                    posterior = post2
+
+            if abs(loglik - prev_loglik) < self.tol:
+                converged = True
+                break
+            prev_loglik = loglik
+
+        b_final, cp_final, gm_final = _unpack(theta)
+        return {
+            "betas": b_final,
+            "class_probs": cp_final,
+            "gammas": gm_final,
+            "posterior": posterior,
+            "loglik": loglik,
+            "converged": converged,
+            "iterations": em_calls,
+            "em_calls": em_calls,
+        }
+
+    def fit(self, betas0=None, class_probs0=None, gammas0=None,
+            de_init=False, de_popsize=6, de_maxiter=20, de_tol=0.01, de_seed=None,
+            em_method="squarem"):
+        """Fit the latent class model via EM or SQUAREM-accelerated EM.
+
+        Parameters
+        ----------
+        betas0 : ndarray, optional
+            Initial class betas, shape (n_classes, K).
+        class_probs0 : ndarray, optional
+            Initial class shares, length n_classes.
+        gammas0 : ndarray, optional
+            Initial membership coefficients, shape (n_classes-1, K_membership).
+        de_init : bool
+            Use Differential Evolution to warm-start the EM betas (overrides
+            ``betas0`` when True).
+        de_popsize, de_maxiter, de_tol, de_seed
+            DE hyper-parameters forwarded to :meth:`_de_warm_start`.
+        em_method : {'standard', 'squarem'}
+            EM solver.  ``'squarem'`` applies the Squared Extrapolation Method
+            (Varadhan & Roland 2008) to accelerate convergence.
+        """
+        if em_method not in ("standard", "squarem"):
+            raise ValueError(f"em_method must be 'standard' or 'squarem', got {em_method!r}")
+
+        if de_init:
+            betas0 = self._de_warm_start(
+                popsize=de_popsize,
+                maxiter=de_maxiter,
+                tol=de_tol,
+                seed=de_seed,
+            )
+
+        best_result = None
+        _fit_once = self._fit_squarem_once if em_method == "squarem" else self._fit_em_once
+
+        start_time = time.time()
+
+        for init_idx in range(self.n_init):
+            seed = self.random_state + init_idx
+            rng = np.random.default_rng(seed)
+            init_betas = betas0 if init_idx == 0 else None
+            init_probs = class_probs0 if init_idx == 0 else None
+            init_gammas = gammas0 if init_idx == 0 else None
+            result = _fit_once(rng, betas0=init_betas, class_probs0=init_probs, gammas0=init_gammas)
+            if best_result is None or result["loglik"] > best_result["loglik"]:
+                best_result = result
+
+        self.class_betas = best_result["betas"]
+        self.class_probs = best_result["class_probs"]
+        self.class_gammas = best_result["gammas"]
+        self.posterior = best_result["posterior"]
+        self.loglik = best_result["loglik"]
+        self.converged = best_result["converged"]
+        self.total_iter = best_result["iterations"]
+        self.em_method = em_method
+
+        if isinstance(self.class_betas, list):
+            self.coeff_est = np.concatenate([np.asarray(b).ravel() for b in self.class_betas])
+            self.coeff_names = []
+            for c in range(self.n_classes):
+                idx = self._class_specs[c]
+                for k in range(len(idx)):
+                    self.coeff_names.append(f"class_{c + 1}_{self.varnames[idx[k]]}")
+        else:
+            self.coeff_est = self.class_betas.ravel()
+            self.coeff_names = [
+                f"class_{class_idx + 1}_{name}"
+                for class_idx in range(self.n_classes)
+                for name in self.varnames
+            ]
+
+        n_gamma_params = 0
+        if self.class_gammas is not None and self._has_membership and self.optimise_membership:
+            n_inter = len(self._intercept_free_classes)
+            n_gamma_params = n_inter + int(self._member_mask.sum())
+        self.num_params = self.coeff_est.size + max(0, self.n_classes - 1) + n_gamma_params
+        self.aic = 2 * self.num_params - 2 * self.loglik
+        self.bic = np.log(self.sample_size) * self.num_params - 2 * self.loglik
+
+        self.estim_time_sec = time.time() - start_time
+        self.post_process()
+
+        return self
+
+    def fit_direct(self, betas0=None, class_probs0=None, gammas0=None,
+                   de_init=False, de_popsize=6, de_maxiter=20, de_tol=0.01,
+                   de_seed=None, maxiter=None):
+        """Fit via direct maximum likelihood (simultaneous optimisation of all parameters).
+
+        Uses scipy L-BFGS-B to directly maximise the log-likelihood with respect
+        to all parameters (class-share logits, per-class betas, and membership
+        gammas) simultaneously.
+
+        This is an alternative to the EM/SQUAREM approach and can be faster
+        when the number of parameters is moderate.
+
+        Parameters
+        ----------
+        betas0, class_probs0, gammas0 : optional
+            Initial values.
+        de_init : bool
+            Warm-start betas via differential evolution (overrides betas0).
+        de_popsize, de_maxiter, de_tol, de_seed
+            DE hyper-parameters.
+        maxiter : int, optional
+            Maximum L-BFGS-B iterations (default: 100 * n_params).
+        """
+        C = self.n_classes
+
+        if de_init:
+            betas0 = self._de_warm_start(
+                popsize=de_popsize, maxiter=de_maxiter,
+                tol=de_tol, seed=de_seed,
+            )
+
+        rng = np.random.default_rng(self.random_state)
+
+        if isinstance(self.class_betas, list) and betas0 is None:
+            betas0 = self._make_initial_betas(rng)
+        elif betas0 is None and self.class_betas is not None:
+            betas0 = self.class_betas.copy()
+
+        if betas0 is None:
+            betas0 = self._make_initial_betas(rng)
+
+        class_probs0 = self._make_initial_class_probs(class_probs0)
+        if self._has_membership:
+            gammas0 = self._make_initial_gammas(rng, gammas0)
+
+        phi0 = np.zeros(C - 1)
+        if C > 1 and class_probs0 is not None and np.all(class_probs0[:-1] > 0):
+            phi0 = (
+                np.log(np.clip(class_probs0[:-1], 1e-300, None))
+                - np.log(np.clip(class_probs0[-1], 1e-300, None))
+            )
+
+        if isinstance(betas0, list):
+            beta0_flat = np.concatenate([np.asarray(b).ravel() for b in betas0])
+        else:
+            beta0_flat = np.asarray(betas0).ravel()
+
+        params0 = np.concatenate([phi0, beta0_flat])
+        if self._has_membership and gammas0 is not None:
+            params0 = np.concatenate([params0, np.asarray(gammas0).ravel()])
+
+        if maxiter is None:
+            maxiter = max(100, 100 * len(params0))
+
+        jax_obj = self._build_jax_full_objective()
+        if jax_obj is not None:
+            _jax_func, _jax_grad = jax_obj
+
+            def _neg_ll_jax(params):
+                b = self.jnp.asarray(params, dtype=self.jnp.float64)
+                v, g = _jax_grad(b)
+                return float(v), np.asarray(g, dtype=float)
+
+            result = minimize(
+                _neg_ll_jax,
+                params0,
+                method="L-BFGS-B",
+                jac=True,
+                options={"maxiter": maxiter, "ftol": self.tol},
+            )
+        else:
+            def _neg_ll(params):
+                return -self._full_loglik(params)
+
+            result = minimize(
+                _neg_ll,
+                params0,
+                method="L-BFGS-B",
+                options={"maxiter": maxiter, "ftol": self.tol},
+            )
+
+        params = result.x
+        offset = C - 1
+
+        betas_flat = []
+        for k in self._Ks:
+            betas_flat.append(params[offset:offset + k])
+            offset += k
+
+        self.class_betas = betas_flat  # always a list of arrays
+        if C > 1:
+            phi_full = np.append(params[:C - 1], 0.0)
+            self.class_probs = np.exp(phi_full - logsumexp(phi_full))
+        else:
+            self.class_probs = np.ones(1)
+
+        if self._has_membership and self.optimise_membership:
+            n_gamma = (C - 1) * self.K_membership
+            if n_gamma > 0:
+                self.class_gammas = params[offset:offset + n_gamma].reshape(C - 1, self.K_membership)
+                offset += n_gamma
+        else:
+            self.class_gammas = None
+
+        self.loglik = -float(result.fun)
+        self.converged = result.success
+
+        self.coeff_est = np.concatenate([np.asarray(b).ravel() for b in betas_flat])
+        self.coeff_names = []
+        for c in range(C):
+            idx = self._class_specs[c]
+            for v in [self.varnames[i] for i in idx]:
+                self.coeff_names.append(f"class_{c + 1}_{v}")
+
+        n_gamma_params = 0
+        if self.class_gammas is not None and self._has_membership and self.optimise_membership:
+            n_gamma_params = self.class_gammas.size
+        self.num_params = self.coeff_est.size + max(0, C - 1) + n_gamma_params
+        self.aic = 2 * self.num_params - 2 * self.loglik
+        self.bic = np.log(self.sample_size) * self.num_params - 2 * self.loglik
+
+        # Compute posteriors for prediction / summary
+        log_choice, _ = self._log_choice_probs_np(self.class_betas)
+        if self._has_membership and self.optimise_membership and self.class_gammas is not None:
+            priors = self._compute_membership_priors(self.class_gammas)
+        else:
+            priors = np.broadcast_to(self.class_probs[None, :], (self.N, C))
+        log_joint = log_choice + np.log(np.clip(priors, 1e-300, None))
+        log_marg = logsumexp(log_joint, axis=1, keepdims=True)
+        self.posterior = np.exp(log_joint - log_marg)
+        self.total_iter = result.nit
+
+        return self
+
+    def get_loglik_null(self):
+        available_counts = np.clip(self.avail.sum(axis=1), 1.0, None)
+        self.loglik_null = float(-np.sum(np.log(available_counts)))
+        return self.loglik_null
+
+    def predict_proba(self):
+        class_choice_probs = self._choice_probs_all_np(self.class_betas)
+        return np.einsum("c,ncj->nj", self.class_probs, class_choice_probs)
+
+    def make_next_class_start(self, jitter_scale=1e-2):
+        next_classes = self.n_classes + 1
+        if self.class_betas is None or self.class_probs is None:
+            raise ValueError("fit the model before constructing a warm start for another class count.")
+
+        source_idx = int(np.argmax(self.class_probs))
+        if isinstance(self.class_betas, list):
+            base_beta = self.class_betas[source_idx].copy()
+            k_new = len(base_beta)
+            rng = np.random.default_rng(self.random_state + next_classes)
+            jitter = rng.normal(scale=jitter_scale, size=k_new)
+            new_betas = self.class_betas.copy()
+            new_betas.append(base_beta + jitter)
+        else:
+            base_beta = self.class_betas[source_idx]
+            rng = np.random.default_rng(self.random_state + next_classes)
+            jitter = rng.normal(scale=jitter_scale, size=base_beta.shape[0])
+            new_betas = np.vstack([self.class_betas, base_beta + jitter])
+
+        new_probs = np.empty(next_classes, dtype=float)
+        new_probs[:-1] = self.class_probs
+        split_share = max(self.class_probs[source_idx] * 0.5, 1e-3)
+        new_probs[source_idx] = split_share
+        new_probs[-1] = split_share
+
+        new_gammas = None
+        if self.class_gammas is not None and self.optimise_membership and self.K_membership > 0:
+            new_gammas = np.zeros((next_classes - 1, self.K_membership))
+            new_gammas[:-1] = self.class_gammas
+            new_gammas[-1] = rng.normal(scale=0.01, size=self.K_membership)
+
+        return new_betas, self._normalize_class_probs(new_probs), new_gammas
+
+    @classmethod
+    def search(
+        cls,
+        X,
+        y,
+        varnames,
+        ids,
+        alts,
+        avail=None,
+        min_classes=1,
+        max_classes=5,
+        criterion="bic",
+        warm_start=True,
+        de_init=False,
+        de_popsize=6,
+        de_maxiter=20,
+        de_tol=0.01,
+        de_seed=None,
+        membership_vars=None,
+        member_params_spec=None,
+        **kwargs,
+    ):
+        """Search over number of latent classes, optionally using DE warm-start.
+
+        Parameters
+        ----------
+        de_init : bool
+            Use Differential Evolution to warm-start betas for each class count.
+            When combined with ``warm_start=True``, DE runs only for ``min_classes``
+            and subsequent counts inherit from the prior model (split-share init).
+        de_popsize, de_maxiter, de_tol, de_seed
+            DE hyper-parameters forwarded to :meth:`_de_warm_start`.
+        membership_vars : list, optional
+            Variables used in the class membership equation.
+        member_params_spec : list or array, optional
+            Per-class membership variable specification.
+        """
+        fitted_models = []
+        best_model = None
+        prev_model = None
+        criterion = criterion.lower()
+
+        for n_classes in range(int(min_classes), int(max_classes) + 1):
+            model = cls(n_classes=n_classes, **kwargs)
+            model.setup(X=X, y=y, varnames=varnames, ids=ids, alts=alts, avail=avail,
+                        membership_vars=membership_vars, member_params_spec=member_params_spec)
+
+            betas0 = None
+            class_probs0 = None
+            gammas0 = None
+            use_de = de_init
+            if warm_start and prev_model is not None and prev_model.n_classes + 1 == n_classes:
+                result = prev_model.make_next_class_start()
+                if len(result) == 3:
+                    betas0, class_probs0, gammas0 = result
+                else:
+                    betas0, class_probs0 = result
+                use_de = False  # warm-start from previous model; skip DE for this count
+
+            model.fit(
+                betas0=betas0,
+                class_probs0=class_probs0,
+                gammas0=gammas0,
+                de_init=use_de,
+                de_popsize=de_popsize,
+                de_maxiter=de_maxiter,
+                de_tol=de_tol,
+                de_seed=de_seed,
+            )
+            model.get_loglik_null()
+            fitted_models.append(model)
+
+            score = getattr(model, criterion)
+            if best_model is None or score < getattr(best_model, criterion):
+                best_model = model
+            prev_model = model
+
+        best_model.search_results = fitted_models
+        return best_model, fitted_models
+
+    # ------------------------------------------------------------------
+    # Internal helpers for numerical standard errors
+    # ------------------------------------------------------------------
+
+    def _full_loglik(self, params: np.ndarray) -> float:
+        """Log-likelihood at full parameter vector."""
+        C = self.n_classes
+        n_phi = C - 1
+
+        if C > 1:
+            phi_full = np.append(params[:n_phi], 0.0)
+            pi = np.exp(phi_full - logsumexp(phi_full))
+        else:
+            pi = np.ones(1)
+
+        offset = n_phi
+        betas = []
+        for k in self._Ks:
+            betas.append(params[offset:offset + k])
+            offset += k
+
+        has_gamma = (self._has_membership and self.optimise_membership
+                     and self.class_gammas is not None and self.K_membership > 0)
+        if has_gamma:
+            Km = self.K_membership
+            n_inter = len(self._intercept_free_classes)
+            class_intercepts = params[offset:offset + n_inter]
+            offset += n_inter
+            active_cv = [(c, v) for c in range(C) for v in range(Km) if self._member_mask[c, v] > 0]
+            gamma_covariates = np.zeros((C, Km))
+            for j, (c, v) in enumerate(active_cv):
+                gamma_covariates[c, v] = params[offset + j]
+            offset += len(active_cv)
+            priors = self._compute_membership_priors(class_intercepts, gamma_covariates)
+        else:
+            priors = np.broadcast_to(pi[None, :], (self.N, self.n_classes))
+
+        _, choice_probs_all = self._log_choice_probs_np(betas)
+        log_chosen = np.log(
+            np.clip(
+                (choice_probs_all * self.y[:, np.newaxis, :]).sum(axis=2),
+                1e-300, None,
+            )
+        )
+        log_joint = log_chosen + np.log(np.clip(priors, 1e-300, None))
+        ll = float(logsumexp(log_joint, axis=1).sum())
+        ll -= self._regularize_l2_betas(betas)
+        ll -= self._regularize_l1_betas(betas)
+        return ll
+
+    def _autograd_hessian(self, params: np.ndarray) -> np.ndarray | None:
+        """Hessian via JAX autograd — exact analytical second derivatives.
+
+        Only works when JAX is enabled, all classes share the same
+        variable set (``len(set(self._Ks)) == 1``), and the JIT-compiled
+        ``_negloglik_flat`` function is available.  Returns ``None``
+        if any precondition is not met (caller should fall back to
+        ``_numerical_hessian``).
+        """
+        if not self._jax_enabled:
+            print("[LC] JAX not enabled; skipping autograd Hessian.")
+            return None
+        if len(set(self._Ks)) != 1:
+            print("[LC] Autograd Hessian requires all classes to share the same variable set.")
+            return None
+
+        cache_key = "_cached_autograd_hessian_fn"
+        if hasattr(self, cache_key):
+            hess_fn = getattr(self, cache_key)
+        else:
+            jax_cache_key = "_jax_full_obj"
+            cached = getattr(self, jax_cache_key, self._build_jax_full_objective())
+            fn = cached[0] if cached else None
+            if fn is None:
+                print("[LC] No cached JAX function available for autograd Hessian.")
+                return None
+            try:
+                hess_fn = self.jit(self.jax.hessian(fn))
+            except Exception:
+                print("[LC] Error occurred while computing autograd Hessian.")
+                return None
+            setattr(self, cache_key, hess_fn)
+
+        try:
+            H = hess_fn(self.jnp.asarray(params, dtype=self.jnp.float64))
+            return np.asarray(H, dtype=float)
+        except Exception:
+            return None
+
+    def _numerical_hessian(self, params: np.ndarray, eps: float = 1e-4) -> np.ndarray:
+        """Numerical Hessian of the log-likelihood via central finite differences.
+
+        Uses O(h^2) accuracy.  Requires 2P + 4*P*(P-1)/2 function evaluations.
+        """
+        P = len(params)
+        H = np.zeros((P, P))
+        f0 = self._full_loglik(params)
+
+        for i in range(P):
+            ei = np.zeros(P)
+            ei[i] = eps
+            H[i, i] = (
+                self._full_loglik(params + ei)
+                - 2.0 * f0
+                + self._full_loglik(params - ei)
+            ) / (eps * eps)
+
+        for i in range(P):
+            for j in range(i + 1, P):
+                ei = np.zeros(P); ei[i] = eps
+                ej = np.zeros(P); ej[j] = eps
+                val = (
+                    self._full_loglik(params + ei + ej)
+                    - self._full_loglik(params + ei - ej)
+                    - self._full_loglik(params - ei + ej)
+                    + self._full_loglik(params - ei - ej)
+                ) / (4.0 * eps * eps)
+                H[i, j] = H[j, i] = val
+
+        return H
+
+    def _delta_method_share_se(
+        self, cov_phi: np.ndarray, pi: np.ndarray
+    ) -> np.ndarray:
+        """Delta-method SE for class shares from the logit-parameter covariance.
+
+        For pi_c = softmax(phi)_c  (phi_C ≡ 0),  the Jacobian is
+            d pi_c / d phi_j  =  pi_c * (delta_{cj} - pi_j)   j = 1..C-1
+        so  Var(pi_c) = J_c' cov_phi J_c.
+
+        Returns se_pi : ndarray, shape (C,)
+        """
+        C = len(pi)
+        if C == 1:
+            return np.zeros(1)
+
+        se_pi = np.zeros(C)
+        for c in range(C):
+            # Jacobian d pi_c / d phi_j for j = 0..C-2
+            jac = np.array(
+                [pi[c] * ((1.0 if c == j else 0.0) - pi[j]) for j in range(C - 1)]
+            )
+            var_c = jac @ cov_phi @ jac
+            se_pi[c] = np.sqrt(max(var_c, 0.0))
+        return se_pi
+
+    # ------------------------------------------------------------------
+    # Public SE computation
+    # ------------------------------------------------------------------
+
+    def compute_standard_errors(self, eps: float = 1e-4):
+        """Compute standard errors via the observed information matrix (Hessian).
+
+        The Hessian of the log-likelihood is computed numerically by central
+        finite differences.  The covariance is  cov = (-H)^{-1}.
+
+        The full parameter vector is::
+
+            [ln(pi_1/pi_C), ..., ln(pi_{C-1}/pi_C),   class-share logits
+             beta_{1,1}, ..., beta_{1,K},              class 1 coefficients
+             ...,
+             beta_{C,1}, ..., beta_{C,K},              class C coefficients
+             gamma_{1,1}, ..., gamma_{C-1,K_mem}]      membership coefficients (if active)
+
+        Returns
+        -------
+        dict with keys:
+            params, se, t_stats, p_values, ci_lo, ci_hi, param_names, cov,
+            se_pi, ci_lo_pi, ci_hi_pi,   <- probability-scale class share SEs
+            gamma_params, gamma_se, gamma_t_stats, gamma_p_values,
+            gamma_ci_lo, gamma_ci_hi, gamma_names,
+            cond_number, se_method
+        """
+        C = self.n_classes
+        Km = self.K_membership
+        pi = self.class_probs  # (C,)
+        n_phi = C - 1
+
+        # ── Assemble full parameter vector ────────────────────────────────
+        if C > 1:
+            phi_vals = (
+                np.log(np.clip(pi[:C - 1], 1e-300, None))
+                - np.log(np.clip(pi[-1], 1e-300, None))
+            )
+        else:
+            phi_vals = np.empty(0)
+
+        if isinstance(self.class_betas, list):
+            beta_flat = np.concatenate([np.asarray(b).ravel() for b in self.class_betas])
+        else:
+            beta_flat = self.class_betas.ravel()
+
+        # Active membership params only (mask==1): masked-out positions never
+        # receive gradient (multiplied by zero everywhere), so including them
+        # here would make the Hessian singular.
+        has_gamma = (self._has_membership and self.optimise_membership
+                     and self.class_gammas is not None and Km > 0)
+        if has_gamma:
+            n_inter = len(self._intercept_free_classes)
+            class_intercepts = self.class_gammas[:n_inter]
+            gamma_covariates = self.class_gammas[n_inter:].reshape(C, Km)
+            active_cv = [(c, v) for c in range(C) for v in range(Km) if self._member_mask[c, v] > 0]
+            gamma_active = np.array([gamma_covariates[c, v] for c, v in active_cv])
+            gamma_flat = np.concatenate([class_intercepts, gamma_active])
+            params = np.concatenate([phi_vals, beta_flat, gamma_flat])
+            n_gamma = gamma_flat.size
+        else:
+            class_intercepts = np.empty(0)
+            active_cv = []
+            gamma_flat = np.empty(0)
+            params = np.concatenate([phi_vals, beta_flat])
+            n_gamma = 0
+
+        # ── JAX autograd Hessian → covariance (numerical fallback) ──
+        #H_a = self._autograd_hessian(params)
+        H_a = None  # forced numerical Hessian (JAX autograd disabled for debugging)
+
+        if H_a is not None and np.isfinite(H_a).all():
+            info = H_a   # hessian(-negloglik) = -hessian(loglik) = observed info
+            se_method = "autograd-hessian"
+        else:
+            # JAX unavailable (or classes with differing variable sets):
+            # fall back to a finite-difference Hessian so searches always
+            # get standard errors and p-values.
+            H_num = self._numerical_hessian(params, eps=eps)
+            if not np.isfinite(H_num).all():
+                raise RuntimeError(
+                    "Hessian could not be computed (autograd unavailable and "
+                    "finite-difference Hessian is non-finite) — standard errors "
+                    "are not available for this model."
+                )
+            info = -H_num   # observed info = -hessian(loglik)
+            se_method = "numerical-hessian (finite differences)"
+
+        cond_number = np.nan
+        cov = None
+        try:
+            eigvals = np.linalg.eigvalsh(info)
+            cond_number = float(eigvals.max() / max(eigvals.min(), 1e-300))
+
+            if eigvals.min() < 1e-8 * eigvals.max():
+                ridge = 1e-6 * eigvals.max()
+                info_reg = info + ridge * np.eye(len(params))
+                cov = np.linalg.inv(info_reg)
+                se_method = "hessian (ridge-regularised)"
+            else:
+                cov = np.linalg.inv(info)
+        except np.linalg.LinAlgError:
+            cov = np.linalg.pinv(info)
+            se_method = "hessian (pinv fallback)"
+
+        if cov is None:
+            cov = np.linalg.pinv(info)
+
+        se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+
+        # ── OPG cross-check (diagnostics only) ────────────────────────────
+        _, choice_probs_all = self._log_choice_probs_np(self.class_betas)
+        log_chosen = np.log(
+            np.clip(
+                (choice_probs_all * self.y[:, np.newaxis, :]).sum(axis=2),
+                1e-300, None,
+            )
+        )
+
+        if has_gamma:
+            priors = self._compute_membership_priors(class_intercepts, gamma_covariates)
+        else:
+            priors = np.broadcast_to(pi[None, :], (self.N, C))
+
+        log_joint = log_chosen + np.log(np.clip(priors, 1e-300, None))
+        log_marg  = logsumexp(log_joint, axis=1, keepdims=True)
+        posterior = np.exp(log_joint - log_marg)
+
+        if C > 1:
+            score_phi = posterior[:, :C - 1] - pi[np.newaxis, :C - 1]
+        else:
+            score_phi = np.zeros((self.N, 0))
+
+        resid = self.y[:, np.newaxis, :] - choice_probs_all
+        try:
+            if len(set(self._Ks)) == 1 and self._Ks[0] == self.K:
+                score_beta = np.einsum(
+                    "ncj,njk->nck", resid * posterior[:, :, np.newaxis], self.X
+                ).reshape(self.N, C * self.K)
+            else:
+                score_beta = np.zeros((self.N, sum(self._Ks)))
+                offset_col = 0
+                for c in range(C):
+                    X_c = self.X[:, :, self._class_specs[c]]
+                    sc = np.einsum(
+                        "nj,njk->nk", resid[:, c, :] * posterior[:, c], X_c
+                    )
+                    kc = self._Ks[c]
+                    score_beta[:, offset_col:offset_col + kc] = sc
+                    offset_col += kc
+        except Exception:
+            score_beta = np.zeros((self.N, sum(self._Ks)))
+
+        if has_gamma:
+            score_gamma = np.zeros((self.N, n_gamma))
+            resid_m = posterior - priors
+            n_inter = len(self._intercept_free_classes)
+            for i, c in enumerate(self._intercept_free_classes):
+                score_gamma[:, i] = resid_m[:, c]
+            for j, (c, v) in enumerate(active_cv):
+                score_gamma[:, n_inter + j] = self.X_membership[:, v] * resid_m[:, c]
+            score = np.hstack([score_phi, score_beta, score_gamma])
+        else:
+            score = np.hstack([score_phi, score_beta]) if C > 1 else score_beta
+
+        opg_diag = np.zeros(len(params))
+        try:
+            JtJ = score.T @ score
+            cov_opg = np.linalg.pinv(JtJ)
+            opg_diag = np.sqrt(np.clip(np.diag(cov_opg), 0.0, None))
+        except Exception:
+            pass
+
+        # ── Inference ─────────────────────────────────────────────────────
+        t_stats  = np.where(se > 1e-12, params / se, 0.0)
+        p_values = 2.0 * (1.0 - _scipy_norm.cdf(np.abs(t_stats)))
+        ci_lo    = params - 1.96 * se
+        ci_hi    = params + 1.96 * se
+
+        # ── Delta-method SEs on probability scale ─────────────────────────
+        cov_phi  = cov[:n_phi, :n_phi] if n_phi > 0 else np.zeros((0, 0))
+        se_pi    = self._delta_method_share_se(cov_phi, pi)
+        ci_lo_pi = np.clip(pi - 1.96 * se_pi, 0.0, 1.0)
+        ci_hi_pi = np.clip(pi + 1.96 * se_pi, 0.0, 1.0)
+
+        # ── Names ─────────────────────────────────────────────────────────
+        phi_names  = [f"ln(pi_{c + 1}/pi_{C})" for c in range(n_phi)]
+        beta_names = [
+            f"class_{c + 1}_{name}"
+            for c in range(C)
+            for name in self.varnames
+        ]
+        param_names = phi_names + beta_names
+
+        # ── Membership parameter slices and names ─────────────────────────
+        gamma_params = np.empty(0)
+        gamma_se = np.empty(0)
+        gamma_t_stats = np.empty(0)
+        gamma_p_values = np.empty(0)
+        gamma_ci_lo = np.empty(0)
+        gamma_ci_hi = np.empty(0)
+        gamma_names = []
+
+        if has_gamma:
+            gamma_start = n_phi + sum(self._Ks)
+            gamma_params = params[gamma_start:]
+            gamma_se = se[gamma_start:]
+            gamma_t_stats = t_stats[gamma_start:]
+            gamma_p_values = p_values[gamma_start:]
+            gamma_ci_lo = ci_lo[gamma_start:]
+            gamma_ci_hi = ci_hi[gamma_start:]
+            mem_vars = list(self.membership_vars) if self.membership_vars else [f"mem_{k}" for k in range(Km)]
+            for c in self._intercept_free_classes:
+                gamma_names.append(f"gamma_intercept_class_{c + 1}")
+            for c, v in active_cv:
+                gamma_names.append(f"gamma_class_{c + 1}_{mem_vars[v]}")
+            param_names += gamma_names
+
+        # ── Standard attributes aligned with coeff_est / coeff_names ──────
+        # The specification search reads model.stderr / model.pvalues to drive
+        # significance-based refinement and PBIL probability updates, so the
+        # class-beta block (which is what coeff_est holds) must be exposed here.
+        n_beta = beta_flat.size
+        self.stderr  = se[n_phi:n_phi + n_beta]
+        self.zvalues = t_stats[n_phi:n_phi + n_beta]
+        self.pvalues = p_values[n_phi:n_phi + n_beta]
+        self.pvalues_member = gamma_p_values
+
+        return {
+            "params":      params,
+            "se":          se,
+            "t_stats":     t_stats,
+            "p_values":    p_values,
+            "ci_lo":       ci_lo,
+            "ci_hi":       ci_hi,
+            "param_names": param_names,
+            "cov":         cov,
+            "se_pi":       se_pi,
+            "ci_lo_pi":    ci_lo_pi,
+            "ci_hi_pi":    ci_hi_pi,
+            "gamma_params": gamma_params,
+            "gamma_se":    gamma_se,
+            "gamma_t_stats": gamma_t_stats,
+            "gamma_p_values": gamma_p_values,
+            "gamma_ci_lo": gamma_ci_lo,
+            "gamma_ci_hi": gamma_ci_hi,
+            "gamma_names": gamma_names,
+            "cond_number": cond_number,
+            "se_method":   se_method,
+            "opg_se":      opg_diag,
+        }
+
+    def summarise_lc(self, compute_se=True):
+        """Print a full econometric-style model summary.
+
+        Parameters
+        ----------
+        compute_se : bool
+            Compute Hessian-based standard errors and print inference table (default True).
+        """
+        C = self.n_classes
+        K = self.K
+        sep  = "=" * 76
+
+        # ── Model-fit header ──────────────────────────────────────────────────
+        print()
+        print(sep)
+        print(f"  Latent Class Logit  ({C} class{'es' if C != 1 else ''})")
+        print(sep)
+        print(f"  Log-Likelihood   : {self.loglik:.6f}")
+        if self.loglik_null is not None:
+            rho2 = 1.0 - self.loglik / self.loglik_null
+            print(f"  Null Log-Lik.    : {self.loglik_null:.6f}")
+            print(f"  McFadden Rho-sq  : {rho2:.4f}")
+        print(f"  AIC              : {self.aic:.4f}")
+        print(f"  BIC              : {self.bic:.4f}")
+        print(f"  Observations     : {self.N}")
+        print(f"  Parameters       : {self.num_params}")
+        conv_str = "Yes" if self.converged else "NO  (hit maxiter)"
+        print(f"  Converged        : {conv_str}  (EM iterations: {self.total_iter})")
+        print(sep)
+
+        # ── Try Hessian-based standard errors ─────────────────────────────────
+        stats = None
+        if compute_se:
+            try:
+                stats = self.compute_standard_errors()
+            except Exception as exc:
+                print(f"  [WARNING] Standard errors could not be computed: {exc}")
+
+        if stats is None:
+            # Fall back to coefficients-only table
+            print("  Class Shares:")
+            for idx, share in enumerate(self.class_probs, start=1):
+                print(f"    class_{idx}: {share:.6f}")
+            print("  Coefficients:")
+            for c_idx, beta in enumerate(self.class_betas, start=1):
+                idx = self._class_specs[c_idx - 1] if self._class_specs is not None else range(len(beta))
+                for k, value in zip(idx, beta):
+                    name = self.varnames[k]
+                    print(f"    class_{c_idx}_{name}: {value:.6f}")
+            if self.class_gammas is not None and self._has_membership and self.optimise_membership:
+                gammas_arr = np.asarray(self.class_gammas)
+                print("  Membership Parameters:")
+                for c in range(self.n_classes - 1):
+                    for k in range(gammas_arr.shape[1]):
+                        label = f"gamma_{c + 1}_{self.membership_vars[k]}"
+                        print(f"    {label}: {gammas_arr[c, k]:.6f}")
+            return
+
+        params   = stats["params"]
+        se       = stats["se"]
+        t_stats  = stats["t_stats"]
+        p_values = stats["p_values"]
+        ci_lo    = stats["ci_lo"]
+        ci_hi    = stats["ci_hi"]
+        se_pi    = stats["se_pi"]
+        ci_lo_pi = stats["ci_lo_pi"]
+        ci_hi_pi = stats["ci_hi_pi"]
+        opg_se   = stats["opg_se"]
+        n_phi    = C - 1
+
+        # ── SE-method diagnostics ─────────────────────────────────────────────
+        cond = stats["cond_number"]
+        print(f"  SE method        : {stats['se_method']}")
+        if not np.isnan(cond):
+            cond_warn = "  [HIGH - SEs may be unreliable]" if cond > 1e8 else ""
+            print(f"  Info-matrix cond : {cond:.3e}{cond_warn}")
+        print(sep)
+
+        col_hdr = (
+            f"  {'Parameter':<22}  {'Coeff':>9}  {'Hess.SE':>9}"
+            f"  {'t-stat':>7}  {'p-value':>8}  {'[OPG.SE]':>9}  95% CI (coeff)"
+        )
+        col_sep = (
+            f"  {'-'*22}  {'-'*9}  {'-'*9}"
+            f"  {'-'*7}  {'-'*8}  {'-'*9}  {'-'*22}"
+        )
+
+        def _row(name, idx):
+            pv    = _pval_str(p_values[idx])
+            stars = _sig_stars(p_values[idx])
+            opg   = f"({opg_se[idx]:.4f})" if idx < len(opg_se) and opg_se[idx] > 0 else ""
+            return (
+                f"  {name:<22}  {params[idx]:>9.4f}  {se[idx]:>9.4f}"
+                f"  {t_stats[idx]:>7.3f}  {pv:>8}  {opg:>9}"
+                f"  [{ci_lo[idx]:>7.4f}, {ci_hi[idx]:>7.4f}] {stars}"
+            )
+
+        # ── Class-share parameters ────────────────────────────────────────────
+        if n_phi > 0:
+            print()
+            print("  CLASS SHARE PARAMETERS")
+            print()
+            print(f"  {'':22}  {'--- Logit scale ---':^38}  {'--- Probability scale ---':^30}")
+            share_hdr = (
+                f"  {'Parameter':<22}  {'log-odds':>9}  {'Hess.SE':>9}"
+                f"  {'t-stat':>7}  {'p-value':>8}"
+                f"  {'Share':>7}  {'Odds':>7}  {'SE(pi)':>7}  95% CI (prob)"
+            )
+            share_sep = (
+                f"  {'-'*22}  {'-'*9}  {'-'*9}"
+                f"  {'-'*7}  {'-'*8}"
+                f"  {'-'*7}  {'-'*7}  {'-'*7}  {'-'*22}"
+            )
+            print(share_hdr)
+            print(share_sep)
+            for i in range(n_phi):
+                phi_i   = params[i]
+                odds_i  = float(np.exp(phi_i))
+                share_i = float(self.class_probs[i])
+                pv      = _pval_str(p_values[i])
+                stars   = _sig_stars(p_values[i])
+                print(
+                    f"  {stats['param_names'][i]:<22}  {phi_i:>9.4f}  {se[i]:>9.4f}"
+                    f"  {t_stats[i]:>7.3f}  {pv:>8}"
+                    f"  {share_i:>7.4f}  {odds_i:>7.4f}  {se_pi[i]:>7.4f}"
+                    f"  [{ci_lo_pi[i]:.4f}, {ci_hi_pi[i]:.4f}] {stars}"
+                )
+            # Base class row (reference, no free parameter)
+            base_c = C
+            print(
+                f"  {'(base: class_' + str(base_c) + ')':22}  {'  0 (ref)':>9}  {'   ---':>9}"
+                f"  {'   ---':>7}  {'     ---':>8}"
+                f"  {self.class_probs[C-1]:>7.4f}  {'  1.000':>7}  {se_pi[C-1]:>7.4f}"
+                f"  [{ci_lo_pi[C-1]:.4f}, {ci_hi_pi[C-1]:.4f}]"
+            )
+
+        # ── Per-class coefficient tables ──────────────────────────────────────
+        offset_cum = n_phi
+        for c in range(C):
+            K_c = self._Ks[c]
+            print()
+            print(f"  CLASS {c + 1} COEFFICIENTS  (share = {self.class_probs[c]:.4f})")
+            print(col_hdr)
+            print(col_sep)
+            idx = self._class_specs[c]
+            for k in range(K_c):
+                vname = self.varnames[idx[k]]
+                print(_row(vname, offset_cum + k))
+            offset_cum += K_c
+
+        # ── Membership parameters ──────────────────────────────────────────
+        gamma_params = stats.get("gamma_params", np.empty(0))
+        if len(gamma_params) > 0:
+            gamma_se = stats["gamma_se"]
+            gamma_t  = stats["gamma_t_stats"]
+            gamma_p  = stats["gamma_p_values"]
+            gamma_lo = stats["gamma_ci_lo"]
+            gamma_hi = stats["gamma_ci_hi"]
+            gamma_n  = stats["gamma_names"]
+
+            print()
+            print("  CLASS MEMBERSHIP PARAMETERS  (gamma)  [reference = class {}]".format(C))
+            print(col_hdr)
+            print(col_sep)
+            gamma_start = n_phi + sum(self._Ks)
+            for gi, (gn, gp, gse, gt, gpv, glo, ghi) in enumerate(zip(
+                gamma_n, gamma_params, gamma_se, gamma_t, gamma_p, gamma_lo, gamma_hi
+            )):
+                pv = _pval_str(gpv)
+                stars = _sig_stars(gpv)
+                opg = ""
+                idx = gamma_start + gi
+                if idx < len(opg_se) and opg_se[idx] > 0:
+                    opg = f"({opg_se[idx]:.4f})"
+                print(
+                    f"  {gn:<22}  {gp:>9.4f}  {gse:>9.4f}"
+                    f"  {gt:>7.3f}  {pv:>8}  {opg:>9}"
+                    f"  [{glo:>7.4f}, {ghi:>7.4f}] {stars}"
+                )
+
+        print()
+        print("  Significance:  *** p<0.001   ** p<0.01   * p<0.05   . p<0.1")
+        print("  SE: observed information (Hessian).  [OPG.SE] shown for comparison.")
+        print("  Note: high SE / low t-stat may indicate near-unidentified parameters.")
+        print(sep)
+
+    def post_process(self):
+        """Compute standard errors once and store them as flat attributes.
+        After this runs, summarise() only reads — it never calls
+        compute_standard_errors() itself."""
+        self.se_computation_error = None
+
+        try:
+            stats = self.compute_standard_errors()
+        except Exception as exc:
+            self.se_computation_error = str(exc)
+            return        
+        
+        self.se_params = stats["params"]
+        self.stderr       = stats["se"]
+        self.zvalues      = stats["t_stats"]
+        self.pvalues      = stats["p_values"]
+        self.ci_lo        = stats["ci_lo"]
+        self.ci_hi        = stats["ci_hi"]
+        self.param_names  = stats["param_names"]
+
+        self.se_pi        = stats["se_pi"]
+        self.ci_lo_pi     = stats["ci_lo_pi"]
+        self.ci_hi_pi     = stats["ci_hi_pi"]
+        self.opg_se       = stats["opg_se"]
+        self.cond_number  = stats["cond_number"]
+        self.se_method    = stats["se_method"]      
+
+        self.gamma_params   = stats["gamma_params"]
+        self.gamma_se       = stats["gamma_se"]
+        self.gamma_t_stats  = stats["gamma_t_stats"]
+        self.gamma_p_values = stats["gamma_p_values"]
+        self.gamma_ci_lo    = stats["gamma_ci_lo"]
+        self.gamma_ci_hi    = stats["gamma_ci_hi"]
+        self.gamma_names    = stats["gamma_names"]
+        """
+        breakpoint()
+        print("[PBIL DEBUG] coeff_names/pvalues alignment:")
+        print(list(zip(self.param_names,self.se_params, self.pvalues))) 
+        print(list((zip(self.gamma_names, self.gamma_params, self.gamma_p_values))))
+        """
+
+"""
+LatentClass — Newton/JAX estimation engine for latent-class discrete choice models.
+=====================================================================================
+Lives alongside ``LatentClassMixedLogit`` in ``latent_class.py``. Same public
+contract (``setup`` / ``fit`` / ``summarise`` — the last one inherited unchanged
+from ``DiscreteChoiceModel`` in ``_choice_model.py``), same specification syntax
+(``class_params_spec`` / ``member_params_spec`` as variable-name lists per class,
+``base_class``), so it is a drop-in alternative you can run on the exact same
+setup call as ``LatentClassMixedLogit`` and compare.
+
+WHAT'S DIFFERENT FROM LatentClassMixedLogit
+--------------------------------------------
+1. M-step = one damped Newton step per class (exact JAX gradient + Hessian)
+   instead of L-BFGS-B. The weighted MNL log-likelihood is globally concave
+   in its linear parameters (McFadden, 1974), so Newton converges in very few
+   steps; Armijo back-tracking is only a safety net.
+2. Native panel support: pass ``panels=True`` and ``ind_id=`` to ``setup()`` to
+   pool multiple choice occasions per individual under ONE shared latent-class
+   draw (the correct treatment for repeated stated-preference data). Without
+   ``panels=True`` it behaves exactly like one-occasion-per-individual (same
+   as LatentClassMixedLogit).
+3. Standard errors: exact observed-information Hessian (JAX autodiff) of the
+   JOINT panel-aware log-likelihood, computed once at the optimum.
+
+WHAT'S DELIBERATELY NOT SUPPORTED (out of scope by design)
+-------------------------------------------------------------
+Box-Cox transformed variables and random parameters (Mixed Logit within a
+class). Concavity of the M-step is what makes the one-step Newton trick valid;
+neither Box-Cox lambdas nor simulated random coefficients preserve it. Use
+``LatentClassMixedLogit`` for those.
+"""
+
+import time
+import numpy as np
+from scipy.stats import norm as _scipy_norm
+
+try:
+    from _choice_model import DiscreteChoiceModel
+except ImportError:
+    from ._choice_model import DiscreteChoiceModel
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax import grad, hessian
+
+jax.config.update("jax_enable_x64", True)
+
+RIDGE = 1e-8
+MIN_COMP = 1e-300
+
+
+def _pval_str(pv: float) -> str:
+    if pv < 0.001:
+        return "< 0.001"
+    return f"{pv:.4f}"
+
+
+def _sig_stars(pv: float) -> str:
+    if pv < 0.001:
+        return "***"
+    if pv < 0.01:
+        return " **"
+    if pv < 0.05:
+        return "  *"
+    if pv < 0.1:
+        return "  ."
+    return ""
+
+
+class LatentClass(DiscreteChoiceModel):
+    """Latent-class MNL with an exact-Newton EM engine and native panel support."""
+
+    def __init__(self, n_classes=2, maxiter=1000, newton_inner_iter=5, ftol=1e-10, gtol=1e-6,
+                 random_state=0, n_init=1, base_class=None,
+                 optimise_membership=True, l2_penalty=0.5, l1_penalty=0.0,membership_correction=True, choice_correction=True,
+                 verbose=1, step_tol=1e-8, max_stagnant=20,):
+
+        self.step_tol = float(step_tol)
+        self.max_stagnant = int(max_stagnant)         
+        self.n_classes = int(n_classes)
+        self.maxiter = int(maxiter)
+        self.newton_inner_iter = int(newton_inner_iter)
+        self.ftol = float(ftol)
+        self.gtol = float(gtol)
+        self.tol = self.ftol  # backward-compat: existing display/print code reads self.tol
+        self.random_state = int(random_state)
+        self.n_init = max(1, int(n_init))
+        self._base_class_arg = base_class
+        self.optimise_membership = bool(optimise_membership)
+        self.l2_penalty = float(l2_penalty)
+        self.l1_penalty = float(l1_penalty)
+        self.verbose = int(verbose)
+        self.descr = "LC-Newton"
+
+        # attributes summarise()/DiscreteChoiceModel expect to find, even
+        # before fit() runs. pred_prob/obs_prob deliberately NOT declared
+        # here (only after fit(), in _finalise) so hasattr() is False and
+        # summarise() skips that block cleanly if called before fit().
+        self.coeff_est = None
+        self.coeff_names = None
+        self.stderr = None
+        self.zvalues = None
+        self.pvalues = None
+        self.class_betas = None
+        self.class_probs = None
+        self.class_gammas = None
+        self.posterior = None
+        self.loglik = None
+        self.loglik_null = None
+        self.aic = None
+        self.bic = None
+        self.converged = False
+        self.total_iter = 0
+        self.num_params = None
+        self.se_computation_error = None
+        self.membership_correction = bool(membership_correction)        
+        self.choice_correction = bool(choice_correction)
+        self.descr = "LC-Newton"
+        if self.membership_correction:
+            self.descr += "-Firth(mem)"
+        if self.choice_correction:
+            self.descr += "-Firth(choice)"
+
+    # ------------------------------------------------------------------
+    # SETUP
+    # ------------------------------------------------------------------
+    def setup(self, X, y, varnames, ids, alts, avail=None,
+              class_params_spec=None, member_params_spec=None,
+              base_class=None, panels=False, ind_id=None,
+              fit_intercept=False, base_alt=None, l1_penalty=None, l2_penalty=None,maxiter=1000):
+        """
+        ids     : choice-situation id — one situation = one block of J rows.
+        panels  : False (default) -> one situation == one individual, exactly
+                  like LatentClassMixedLogit. True -> pool situations sharing
+                  the same `ind_id` under one latent-class draw.
+        ind_id  : individual id (same length as the raw long-format rows).
+                  Required if panels=True. Ignored (defaults to `ids`) if
+                  panels=False.
+        base_alt : alternative to be used as the base alternative for the model.
+        class_params_spec, member_params_spec, base_class : same syntax as
+                  LatentClassMixedLogit (variable-name lists per class).
+                  member_params_spec entries may be empty lists (delta/intercept
+                  only, no covariates for that class) — handled correctly.
+        """
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        ids = np.asarray(ids)
+        alts = np.asarray(alts)
+        varnames = list(varnames)
+        
+        if avail is None:
+            avail = np.ones_like(y, dtype=float)
+        else:
+            avail = np.asarray(avail, dtype=float)
+
+        if panels and ind_id is None:
+            raise ValueError("panels=True requires ind_id.")
+        ind_id = np.asarray(ind_id) if ind_id is not None else ids
+
+        _, first_idx = np.unique(alts, return_index=True)
+        self.alts = alts[np.sort(first_idx)]
+        self.J = len(self.alts)
+
+        if fit_intercept:           
+            self.base_alt = base_alt if base_alt is not None else self.alts[0]
+            asc_alts = [a for a in self.alts if a != self.base_alt]
+            asc_names = [f"intercept.{a}" for a in asc_alts]
+            if asc_alts and not any(n in varnames for n in asc_names):
+                asc_cols = np.column_stack([(alts == a).astype(float) for a in asc_alts])
+                X = np.column_stack([asc_cols, X])
+                varnames = asc_names + varnames
+        else:
+            self.base_alt = None
+
+        if fit_intercept and asc_names and class_params_spec is not None:
+            already_has_asc = any(v in asc_names for spec in class_params_spec for v in spec)
+            if not already_has_asc:
+                class_params_spec = [
+                    list(asc_names) + [v for v in spec if v not in asc_names]
+                    for spec in class_params_spec
+                ]
+
+        if class_params_spec is not None:
+            _sort_key = lambda v: (0, str(v)) if (str(v).startswith('intercept.') or v == '_inter') else (1, str(v))
+            class_params_spec = [sorted(spec, key=_sort_key) for spec in class_params_spec]
+
+        self.K = X.shape[1]
+        self.varnames = varnames
+        if l1_penalty is not None:
+            self.l1_penalty = float(l1_penalty)
+        if l2_penalty is not None:
+            self.l2_penalty = float(l2_penalty)
+
+        order = np.lexsort((alts, ids))
+        X, y, avail = X[order], y[order], avail[order]
+        ids_s = ids[order]
+        ind_s = ind_id[order]
+
+        uniq_sit, counts = np.unique(ids_s, return_counts=True)
+        if np.any(counts != self.J):
+            raise ValueError("LatentClass requires balanced long-format data by choice id.")
+
+        n_sit = len(uniq_sit)
+        X3 = X.reshape(n_sit, self.J, self.K)
+        y3 = y.reshape(n_sit, self.J)
+        av3 = avail.reshape(n_sit, self.J)
+        ind_per_sit = ind_s.reshape(n_sit, self.J)[:, 0]
+
+        uniq_ind, inv = np.unique(ind_per_sit, return_inverse=True)
+        self.N = len(uniq_ind)
+        self.ids = uniq_ind
+
+        counts_per_ind = np.bincount(inv, minlength=self.N)
+        P = int(counts_per_ind.max())
+        self.P = P
+        self.sample_size = int(n_sit)
+
+        Xp = np.zeros((self.N, P, self.J, self.K))
+        yp = np.zeros((self.N, P, self.J))
+        avp = np.zeros((self.N, P, self.J))
+        mask = np.zeros((self.N, P))
+        slot = np.zeros(self.N, dtype=int)
+        for s in range(n_sit):
+            i = inv[s]
+            t = slot[i]
+            Xp[i, t] = X3[s]
+            yp[i, t] = y3[s]
+            avp[i, t] = av3[s]
+            mask[i, t] = 1.0
+            slot[i] += 1
+
+        self.X = Xp                 # (N, P, J, K) — kept for reference/debug
+        self.y = yp
+        self.avail = avp
+        self.panel_mask = mask
+        self.panel_info = mask      # name summarise() looks for
+
+        # ---- class specs (same convention/semantics as LatentClassMixedLogit)
+        if class_params_spec is None:
+            class_params_spec = [list(varnames) for _ in range(self.n_classes)]
+        self._class_specs, Ks = [], []
+        for c, spec in enumerate(class_params_spec):
+            idxs = []            
+            for v in spec:
+                if v == '_inter':
+                    continue
+                if v not in varnames:
+                    raise ValueError(f"Class {c} variable '{v}' not found in varnames.")
+                idxs.append(varnames.index(v))
+            self._class_specs.append(np.array(idxs, dtype=int))
+            Ks.append(len(idxs))
+        self._Ks = np.array(Ks, dtype=int)
+
+        # ---- base class + membership (same convention as LatentClassMixedLogit)
+        bc = base_class if base_class is not None else (
+            self._base_class_arg if self._base_class_arg is not None else self.n_classes - 1)
+        self.base_class = bc
+       
+        
+        self._intercept_free_classes = [c for c in range(self.n_classes) if c != self.base_class]
+        n_inter = len(self._intercept_free_classes)
+        self._n_inter = n_inter
+
+        """
+
+        ##############################
+        
+        self._intercept_free_classes = [
+            c for c in range(self.n_classes)
+            if c != self.base_class and (
+                member_params_spec is None
+                or (c < len(member_params_spec) and '_inter' in member_params_spec[c])
+            )
+        ]
+        n_inter = len(self._intercept_free_classes)
+        self._n_inter = n_inter
+
+        """
+     
+        #############################
+
+        self._has_membership = member_params_spec is not None
+        self.member_params_spec = member_params_spec
+        if self._has_membership:
+            covariate_vars = sorted({v for arr in member_params_spec for v in arr if v != '_inter'})
+            self.membership_vars = covariate_vars
+            self.K_membership = len(covariate_vars)
+            mem_idx = [varnames.index(v) for v in covariate_vars]
+            var_to_col = {v: i for i, v in enumerate(covariate_vars)}
+            self._member_mask = np.zeros((self.n_classes, self.K_membership))
+            for c in range(self.n_classes):
+                spec = member_params_spec[c] if c < len(member_params_spec) else []
+                for v in spec:
+                    if v != '_inter' and v in var_to_col:
+                        self._member_mask[c, var_to_col[v]] = 1.0
+            Zm = np.zeros((self.N, self.K_membership))
+            for i in range(self.N):
+                t0 = int(np.argmax(mask[i]))     # first real occasion
+                Zm[i] = Xp[i, t0, 0, mem_idx]
+            self.X_membership = Zm
+        else:
+            self.membership_vars = None
+            self.K_membership = 0
+            self._member_mask = np.zeros((self.n_classes, 0))
+            self.X_membership = None
+
+        # ---- device arrays --------------------------------------------------
+        self._Xd = jnp.asarray(self.X)
+        self._yd = jnp.asarray(self.y)
+        self._avd = jnp.asarray(self.avail)
+        self._maskd = jnp.asarray(self.panel_mask)
+        self._Zmd = jnp.asarray(self.X_membership) if self.X_membership is not None else None
+        self._member_mask_d = jnp.asarray(self._member_mask)
+
+        self.class_x_names_ = None  # not used by this engine
+        return self    
+   
+
+    # ------------------------------------------------------------------
+    # KERNELS (built fresh per fit(), since they close over device arrays)
+    # ------------------------------------------------------------------
+    def _class_ll(self, beta_active, c):
+        """(N,) panel-aggregated chosen log-likelihood for class c."""
+        idx = jnp.asarray(self._class_specs[c])
+        Xc = jnp.take(self._Xd, idx, axis=3)                       # (N,P,J,Kc)
+        util = jnp.einsum('npjk,k->npj', Xc, beta_active)
+        util = jnp.where(self._avd > 0, util, -1e10)
+        util = util - jnp.max(util, axis=2, keepdims=True)
+        expu = jnp.exp(util) * self._avd
+        denom = jnp.clip(jnp.sum(expu, axis=2, keepdims=True), MIN_COMP)
+        logp = util - jnp.log(denom)
+        ll_np = jnp.sum(self._yd * logp, axis=2)                    # (N,P)
+        return jnp.sum(ll_np * self._maskd, axis=1)                 # (N,)
+
+    def _separation_xbar(self, c, betas, w_i):
+        """Weighted Konis (2007) structure vectors for class c's standard
+        multinomial choice stage: chosen-vs-each-available-alternative
+        contrasts (Konis 2007, Sec. 1.4). w_i: (N,) posterior weight for
+        class c. Returns an (n_rows, Kc) array ready for konis_separation_test."""
+        idx = self._class_specs[c]
+        Xc = np.asarray(self.X)[:, :, :, idx]                        # (N,P,J,Kc)
+        yc = np.asarray(self.y)                                      # (N,P,J)
+        avail = np.asarray(self.avail)                                # (N,P,J)
+        real = np.asarray(self.panel_mask) > 0                        # (N,P)
+        j_chosen = np.argmax(yc, axis=2)                               # (N,P)
+        x_chosen = np.take_along_axis(
+            Xc, j_chosen[:, :, None, None], axis=2)[:, :, 0, :]         # (N,P,Kc)
+
+        rows = []
+        for j in range(self.J):
+            mask = (avail[:, :, j] > 0) & (j_chosen != j) & real
+            diff = x_chosen - Xc[:, :, j, :]                            # (N,P,Kc)
+            w = w_i[:, None] * mask
+            rows.append((w[:, :, None] * diff).reshape(-1, diff.shape[-1]))
+        return np.concatenate(rows, axis=0)
+    
+    def _membership_logits(self, inter, gamma):
+        C = self.n_classes
+        logits = jnp.zeros((self.N, C))
+        for i, c in enumerate(self._intercept_free_classes):
+            logits = logits.at[:, c].set(inter[i])
+        if self.K_membership > 0:
+            gamma_m = gamma * self._member_mask_d
+            logits = logits + self._Zmd @ gamma_m.T
+        return logits
+
+    def _membership_log_probs(self, inter, gamma):
+        logits = self._membership_logits(inter, gamma)
+        logits = logits - jnp.max(logits, axis=1, keepdims=True)
+        return logits - jnp.log(jnp.clip(jnp.sum(jnp.exp(logits), axis=1, keepdims=True), MIN_COMP))
+    
+    def _separation_xbar_membership(self, s, R_last):
+        """Weighted Konis (2007) structure vectors for class s's membership
+        logit (one-vs-rest contrasts against every other class, Sec. 1.4),
+        using R_last directly as fractional ('soft-label') weights — this
+        mirrors exactly how the M-step already estimates gamma via weighted
+        MLE, no hard class assignment is introduced. Returns an
+        (n_rows, Km_active) array, or (0,0) if class s has no free gamma."""
+        if not self._has_membership or self.K_membership == 0:
+            return np.zeros((0, 0))
+        active = np.where(self._member_mask[s] > 0)[0]
+        if active.size == 0:
+            return np.zeros((0, 0))
+        Z = np.asarray(self.X_membership)[:, active]                # (N,Km_active)
+        R = np.asarray(R_last)                                       # (N,C)
+        rows = []
+        for sp in range(R.shape[1]):
+            if sp == s:
+                continue
+            rows.append(R[:, s][:, None] * Z)
+            rows.append(-R[:, sp][:, None] * Z)
+        return np.concatenate(rows, axis=0)
+
+    def _class_ll_matrix(self, betas):
+        return jnp.stack([self._class_ll(betas[c], c) for c in range(self.n_classes)], axis=1)
+
+    def _estep(self, betas, inter, gamma, pi):
+       
+        ll_c = self._class_ll_matrix(betas)
+
+        if self._has_membership and self.optimise_membership:
+            logH = self._membership_log_probs(inter, gamma)
+        else:
+            logpi = jnp.log(jnp.clip(pi, MIN_COMP))
+            logH = jnp.broadcast_to(logpi[None, :], (self.N, self.n_classes))
+        num = ll_c + logH
+        denom = jax.scipy.special.logsumexp(num, axis=1, keepdims=True)
+        R = jnp.exp(num - denom)
+        return R, jnp.sum(denom)   
+
+    # ------------------------------------------------------------------
+    # NEWTON STEP (generic, with Armijo back-tracking). Takes a pre-built
+    # (value, grad, hessian) triple of JIT-compiled closures — built ONCE
+    # per fit() call in `_build_kernels`, reused across every EM iteration
+    # and every n_init restart, so JAX traces each shape exactly once.
+    # ------------------------------------------------------------------
+    def _newton(self, fgh, x0, *args):
+        f_j, g_j, h_j = fgh
+        x = x0
+        for _ in range(self.newton_inner_iter):
+            g = g_j(x, *args)
+            gnorm = float(jnp.linalg.norm(g))
+            if gnorm < 1e-10:
+                break
+            H = h_j(x, *args) + jnp.eye(x.shape[0], dtype=x.dtype) * RIDGE
+            try:
+                step = jnp.linalg.solve(H, g)
+            except Exception:
+                break
+            f0 = float(f_j(x, *args))
+            t = 1.0
+            accepted = False
+            for _ in range(10):
+                cand = x - t * step
+                fc = float(f_j(cand, *args))
+                if np.isfinite(fc) and fc <= f0 + 1e-12:
+                    x = cand
+                    accepted = True
+                    break
+                t *= 0.5
+            if not accepted:
+                break
+        return x
+
+    def _build_kernels(self):
+        """Build and JIT-compile, once per fit() call, a (value, grad,
+        hessian) triple per class (class index baked into the closure, so
+        no static_argnums juggling) and one for the membership block.
+        Raw (unpenalized) triples are always kept too, under *_raw — used
+        by post-fit Firth-shift diagnostics regardless of which correction
+        flags were active during estimation."""
+        class_fgh = []
+        class_fgh_raw = []
+        for c in range(self.n_classes):
+            def nll(beta, w, c=c):
+                return -jnp.sum(w * self._class_ll(beta, c))
+            raw_triple = (jax.jit(nll), jax.jit(grad(nll)), jax.jit(hessian(nll)))
+            class_fgh_raw.append(raw_triple)
+
+            if self.choice_correction:
+                def class_info(beta, w, c=c):
+                    """Unpenalized (ridge-stabilized) observed Fisher information."""
+                    H = hessian(lambda b: -nll(b, w, c=c))(beta)
+                    return -H + jnp.eye(beta.shape[0], dtype=beta.dtype) * RIDGE
+
+                def class_value(beta, w, c=c):
+                    info = class_info(beta, w, c=c)
+                    _, logdet = jnp.linalg.slogdet(info)
+                    return nll(beta, w, c=c) - 0.5 * logdet
+
+                # Curvature: classical Firth-Newton practice — unpenalized
+                # Fisher information, not hessian(class_value). Avoids
+                # 4th-order derivatives (same NaN risk as the membership block).
+                class_fgh.append((jax.jit(class_value), jax.jit(grad(class_value)), jax.jit(class_info)))
+            else:
+                class_fgh.append(raw_triple)
+
+        n_inter, Km, C = self._n_inter, self.K_membership, self.n_classes
+
+        def mem_ll(v, R):
+            inter = v[:n_inter]
+            gamma = v[n_inter:].reshape(C, Km)
+            logH = self._membership_log_probs(inter, gamma)
+            return jnp.sum(R * logH)
+
+        def mem_nll(v, R):
+            return -mem_ll(v, R)
+
+        def mem_info(v, R):
+            """Unpenalized (ridge-stabilized) observed Fisher information."""
+            H = hessian(lambda vv: mem_ll(vv, R))(v)
+            return -H + jnp.eye(v.shape[0], dtype=v.dtype) * RIDGE
+
+        mem_fgh_raw = (jax.jit(mem_nll), jax.jit(grad(mem_nll)), jax.jit(hessian(mem_nll)))
+
+        if self.membership_correction:
+            def mem_value(v, R):
+                info = mem_info(v, R)
+                _, logdet = jnp.linalg.slogdet(info)
+                return -(mem_ll(v, R) + 0.5 * logdet)
+
+            # Firth score: grad of (ll + 0.5*log|I|) — needs 3rd-order derivs
+            # of the base log-lik. Stable.
+            mem_grad = jax.jit(grad(mem_value))
+
+            # Curvature: classical Firth-Newton practice — use the *unpenalized*
+            # Fisher information, not hessian(mem_value). Avoids 4th-order
+            # derivatives (the source of the NaNs).
+            mem_fgh = (jax.jit(mem_value), mem_grad, jax.jit(mem_info))
+        else:
+            mem_fgh = mem_fgh_raw
+
+        self._class_fgh = class_fgh
+        self._class_fgh_raw = class_fgh_raw
+        self._mem_fgh = mem_fgh
+        self._mem_fgh_raw = mem_fgh_raw
+
+    def _joint_negll(self, betas, inter, gamma, pi):
+        _, ll = self._estep(betas, inter, gamma, pi)
+        return -ll
+
+    # ------------------------------------------------------------------
+    # ONE EM STEP
+    # ------------------------------------------------------------------
+    def _em_step(self, betas, inter, gamma, pi):
+        R, ll = self._estep(betas, inter, gamma, pi)
+
+        new_betas = []
+        for c in range(self.n_classes):
+            b = self._newton(self._class_fgh[c], betas[c], R[:, c])
+            new_betas.append(b)
+
+        n_inter = self._n_inter
+        if self._has_membership and self.optimise_membership:
+            Km = self.K_membership
+            v0 = jnp.concatenate([inter, gamma.ravel()])
+            v1 = self._newton(self._mem_fgh, v0, R)
+            new_inter = v1[:n_inter]
+            new_gamma = v1[n_inter:].reshape(self.n_classes, Km) if Km > 0 else gamma
+            new_pi = pi
+        else:
+            new_inter, new_gamma = inter, gamma
+            new_pi = R.mean(axis=0)
+            new_pi = new_pi / jnp.sum(new_pi)
+
+        return new_betas, new_inter, new_gamma, new_pi, float(ll), R
+
+    # ------------------------------------------------------------------
+    # FIT (SQUAREM-accelerated EM with monotonicity back-tracking)
+    # ------------------------------------------------------------------
+    def fit(self, betas0=None, inter0=None, gamma0=None):
+        t_fit0 = time.time()
+        C = self.n_classes
+
+        if betas0 is not None and isinstance(betas0, list) and betas0 and isinstance(betas0[0], dict):
+            rng0 = np.random.default_rng(self.random_state)
+            resolved = []
+            for c in range(self.n_classes):
+                names_c = [self.varnames[i] for i in self._class_specs[c]]
+                dom_map = betas0[c] if c < len(betas0) else {}
+                vals = [dom_map.get(v, float(rng0.normal(scale=0.05))) for v in names_c]
+                if isinstance(self, LatentClassConditional):
+                    vals.append(dom_map.get('no_purchase', float(rng0.normal(scale=0.05))))
+                resolved.append(np.array(vals, dtype=float))
+            betas0 = resolved
+
+        self._build_kernels()
+        best = None
+
+        multistart_ll = []
+        multistart_kind = []
+
+        # Each of betas0/inter0/gamma0 is independent: 10% exact + 30%
+        # jittered + 60% random initialisations, gated only on whether THAT
+        # specific piece was provided — passing betas0 alone doesn't force
+        # inter0/gamma0 to anything, they just fall back to random.
+        n_exact_b  = int(np.ceil(0.10 * self.n_init)) if betas0 is not None else 0
+        n_jitter_b = int(np.ceil(0.30 * self.n_init)) if betas0 is not None else 0
+        jitter_scales_b = np.linspace(0.05, 0.20, n_jitter_b) if n_jitter_b > 0 else np.array([])
+
+        n_inter, Km = self._n_inter, self.K_membership
+
+        if isinstance(inter0, dict):
+            inter0 = np.array([inter0.get(c, 0.0) for c in self._intercept_free_classes])
+
+        if isinstance(gamma0, list) and gamma0 and isinstance(gamma0[0], dict):
+            mem_vars = self.membership_vars or []
+            gamma_arr = np.zeros((C, Km))
+            for c in range(C):
+                dom_map = gamma0[c] if c < len(gamma0) else {}
+                for k, v in enumerate(mem_vars):
+                    if v in dom_map:
+                        gamma_arr[c, k] = dom_map[v]
+            gamma0 = gamma_arr
+
+        inter0_ok = inter0 is not None and np.asarray(inter0).shape == (n_inter,)
+        n_exact_i  = int(np.ceil(0.10 * self.n_init)) if inter0_ok else 0
+        n_jitter_i = int(np.ceil(0.30 * self.n_init)) if inter0_ok else 0
+        jitter_scales_i = np.linspace(0.05, 0.20, n_jitter_i) if n_jitter_i > 0 else np.array([])
+
+        gamma0_ok = gamma0 is not None and np.asarray(gamma0).shape == (C, Km)
+        n_exact_g  = int(np.ceil(0.10 * self.n_init)) if gamma0_ok else 0
+        n_jitter_g = int(np.ceil(0.30 * self.n_init)) if gamma0_ok else 0
+        jitter_scales_g = np.linspace(0.05, 0.20, n_jitter_g) if n_jitter_g > 0 else np.array([])
+        
+
+        if inter0 is not None and not inter0_ok:
+            print(f"[LC] inter0 shape mismatch (expected ({n_inter},)) — ignoring, using random init.")
+        if gamma0 is not None and not gamma0_ok:
+            print(f"[LC] gamma0 shape mismatch (expected ({C}, {Km})) — ignoring, using random init.")
+
+        max_attempts = 2 * self.n_init
+        n_converged = 0
+        attempt = 0
+
+        all_attempts = []
+
+        while n_converged < self.n_init and attempt < max_attempts:
+            init_idx = attempt
+            attempt += 1
+            attempt_t0 = time.time()
+            rng = np.random.default_rng(self.random_state + init_idx)
+
+            if betas0 is not None and init_idx < n_exact_b:
+                betas = [jnp.asarray(b) for b in betas0]
+                kind_b = 'memory'
+            elif betas0 is not None and init_idx < n_exact_b + n_jitter_b:
+                scale = float(jitter_scales_b[init_idx - n_exact_b])
+                betas = [jnp.asarray(np.asarray(b) + rng.normal(scale=scale, size=len(b)))
+                         for b in betas0]
+                kind_b = 'memory_jitter'
+            else:
+                betas = [jnp.asarray(rng.normal(scale=0.05, size=int(k))) for k in self._Ks]
+                kind_b = 'random'
+
+            if inter0_ok and init_idx < n_exact_i:
+                inter = jnp.asarray(inter0)
+            elif inter0_ok and init_idx < n_exact_i + n_jitter_i:
+                scale = float(jitter_scales_i[init_idx - n_exact_i])
+                inter = jnp.asarray(np.asarray(inter0) + rng.normal(scale=scale, size=n_inter))
+            else:
+                inter = jnp.asarray(rng.normal(scale=0.01, size=n_inter))
+
+            if gamma0_ok and init_idx < n_exact_g:
+                gamma = jnp.asarray(gamma0)
+            elif gamma0_ok and init_idx < n_exact_g + n_jitter_g:
+                scale = float(jitter_scales_g[init_idx - n_exact_g])
+                gamma = jnp.asarray(np.asarray(gamma0) + rng.normal(scale=scale, size=(C, Km)))
+            else:
+                gamma = jnp.asarray(rng.normal(scale=0.01, size=(C, Km)))
+
+            kind = kind_b  # multistart_kind still reported off the betas schedule      
+            #print(f"[SEQ init {init_idx}] betas={[np.asarray(b) for b in betas]} "
+             #   f"inter={np.asarray(inter)} gamma={np.asarray(gamma)}", flush=True)
+            pi = jnp.full(C, 1.0 / C)
+            
+            prev_ll = -np.inf
+            converged = False
+            R_last = None
+            n_iter = 0
+            stagnant_iter = 0 
+            ftol_res, gtol_res = float('inf'), float('inf')
+            self.verbose_trace=False
+            if getattr(self, 'verbose_trace', True):
+                _, ll0 = self._estep(betas, inter, gamma, pi)
+                print(f"   0 | {float(ll0):>11.3f} |  (initial point, before first EM step)")
+
+            for it in range(1, self.maxiter + 1):
+                n_iter = it
+                b1, i1, g1, p1, ll1, R1 = self._em_step(betas, inter, gamma, pi)
+                b2, i2, g2, p2, ll2, R2 = self._em_step(b1, i1, g1, p1)
+
+                def flat(bts, ii, gg, pp):
+                    return jnp.concatenate([jnp.concatenate(bts), ii, gg.ravel(), pp])
+
+                th0, th1, th2 = flat(betas, inter, gamma, pi), flat(b1, i1, g1, p1), flat(b2, i2, g2, p2)
+                r = th1 - th0
+                v = th2 - 2.0 * th1 + th0
+                nv = float(jnp.linalg.norm(v))
+
+                if nv < 1e-14:
+                    betas, inter, gamma, pi, ll, R_last = b2, i2, g2, p2, ll2, R2
+                else:
+                    alpha = min(-float(jnp.linalg.norm(r)) / nv, -1.0)
+                    accepted = False
+                    for _ in range(10):
+                        th_p = th0 - 2.0 * alpha * r + alpha ** 2 * v
+                        off = 0
+                        b_cand = []
+                        for k in self._Ks:
+                            b_cand.append(th_p[off:off + int(k)]); off += int(k)
+                        i_cand = th_p[off:off + n_inter]; off += n_inter
+                        g_cand = th_p[off:off + C * Km].reshape(C, Km); off += C * Km
+                        p_cand = th_p[off:off + C]
+                        p_cand = jnp.clip(p_cand, 1e-9, None)
+                        p_cand = p_cand / jnp.sum(p_cand)
+                        _, ll_cand = self._estep(b_cand, i_cand, g_cand, p_cand)
+                        ll_cand = float(ll_cand)
+                        if np.isfinite(ll_cand) and ll_cand >= ll1:
+                            betas, inter, gamma, pi, ll = b_cand, i_cand, g_cand, p_cand, ll_cand
+                            accepted = True
+                            break
+                        alpha = (alpha - 1.0) / 2.0
+                    if not accepted:
+                        betas, inter, gamma, pi, ll = b2, i2, g2, p2, ll2
+                    R_last, _ = self._estep(betas, inter, gamma, pi)
+
+                theta_after = flat(betas, inter, gamma, pi)
+                step_norm = float(jnp.linalg.norm(theta_after - th0))
+                delta_ll = ll - prev_ll
+
+                n_beta_tot = int(sum(int(k) for k in self._Ks))
+                max_beta_delta = float(jnp.max(jnp.abs(
+                    theta_after[:n_beta_tot] - th0[:n_beta_tot]
+                )))
+
+                max_beta_delta = float(jnp.max(jnp.abs(theta_after[:sum(int(k) for k in self._Ks)]
+                                                          - th0[:sum(int(k) for k in self._Ks)])))
+                
+                grad_choice_vecs = []
+                for c, beta_c in enumerate(betas):
+                    _, g_active_c, _ = self._class_fgh[c]
+                    w_c = jnp.asarray(R_last[:, c])
+                    grad_choice_vecs.append(np.asarray(g_active_c(beta_c, w_c)))
+                grad_choice_norms = [float(np.max(np.abs(v))) if v.size else 0.0
+                                    for v in grad_choice_vecs]
+
+                if self._has_membership:
+                    v_dense = jnp.concatenate([inter, gamma.ravel()])
+                    _, g_active_m, _ = self._mem_fgh
+                    grad_member_vec = np.asarray(g_active_m(v_dense, jnp.asarray(R_last)))
+                else:
+                    grad_member_vec = np.array([])
+                grad_member_norm = float(np.max(np.abs(grad_member_vec))) if grad_member_vec.size else 0.0
+
+                if not hasattr(self, 'grad_history'):
+                    self.grad_history = []
+                self.grad_history.append((it, ll, grad_choice_norms, grad_member_norm))
+
+                if getattr(self, 'verbose_trace', False):
+                    if it == 1:
+                        gc_hdr = "".join(f" |g_ch|_C{c+1:<3}" for c in range(len(betas)))
+                        print(f"{'it':>4} | {'ll':>11} | {'d_ll':>10} | {'step':>8} | {'max_dB':>10} |{gc_hdr} | |g_mem|")
+                        print("-" * (4 + 11 + 10 + 8 + 13 + len(betas) * 13 + 12))
+                    gc_str = "".join(f" {g:>11.3e}" for g in grad_choice_norms)
+                    print(f"{it:4d} | {ll:11.3f} | {delta_ll:10.3e} | {step_norm:8.3e} | {max_beta_delta:10.3e} |{gc_str} | {grad_member_norm:.3e}")
+
+                ftol_res = abs(delta_ll)
+                gtol_res = max(max(grad_choice_norms) if grad_choice_norms else 0.0, grad_member_norm)
+                 # ---- Convergence by both criteria --------------------------
+                if ftol_res < self.ftol and gtol_res < self.gtol:
+                    converged = True
+                    break
+
+                # ---- Early stopping on stagnation --------------------------
+                # step_norm < step_tol means neither the outer SQUAREM
+                # extrapolation nor the inner Newton steps produced any
+                # movement. If this repeats for max_stagnant iterations,
+                # the optimiser cannot make further progress even though
+                # the gradient is not zero (typically because the Armijo
+                # line search inside _newton rejects every step, e.g. when
+                # the penalised objective has lost convexity along the
+                # current direction). Exit with converged=False so that
+                # the caller counts this attempt as failed.
+                if step_norm < self.step_tol:
+                    stagnant_iter += 1
+                    if stagnant_iter >= self.max_stagnant:
+                        print(f"[LC] EARLY STOP at iter {it}/{self.maxiter}: "
+                              f"step_norm < {self.step_tol:.0e} for "
+                              f"{self.max_stagnant} consecutive iterations; "
+                              f"final |g| = {gtol_res:.3e} (gtol = {self.gtol:.0e}). "
+                              f"Optimiser is stuck, not converged. "
+                              f"Marking attempt as NOT converged.")
+                        converged = False
+                        break
+                else:
+                    stagnant_iter = 0
+                prev_ll = ll
+
+            ftol_ok = "OK" if ftol_res < self.ftol else "X"
+            gtol_ok = "OK" if gtol_res < self.gtol else "X"
+            kind_disp = kind.replace('_', ' ').title()
+            attempt_time = time.time() - attempt_t0
+            is_degen = is_degenerate_candidate(betas, np.asarray(R_last.mean(axis=0)))
+            is_sep_choice = any(
+                konis_separation_test(self._separation_xbar(c, betas, np.asarray(R_last)[:, c]))['separated']
+                for c in range(len(betas))
+            )
+            is_sep_member = any(
+                konis_separation_test(self._separation_xbar_membership(c, R_last))['separated']
+                for c in self._intercept_free_classes
+            ) if self._has_membership else False
+            is_sep = is_sep_choice or is_sep_member
+
+            print(f"[LC] {n_converged + 1:>2}/{self.n_init}  ({kind_disp}) | iter{n_iter:4d}/{self.maxiter} | "
+                  f"LogLik = {ll:.6f} | ftol_res = {ftol_res:.2e} {ftol_ok} | gtol_res = {gtol_res:.2e} {gtol_ok} | "
+                  f"time={attempt_time:.1f}s | " + ("[CONVERGED]" if converged else "[NOT CONVERGED]")+
+                  (" [DEGENERATED]" if is_degen else "")
+                  + (" [SEPARATED:CHOICE]" if is_sep_choice else "")
+                  + (" [SEPARATED:MEMBER]" if is_sep_member else ""))
+
+            if (is_sep_choice or is_sep_member):
+                if is_sep_choice:
+                    for c in range(len(betas)):
+                        xbar_c = self._separation_xbar(c, betas, np.asarray(R_last)[:, c])
+                        if konis_separation_test(xbar_c)['separated']:
+                            names_c = [self.varnames[i] for i in self._class_specs[c]]
+                            culprits = attribute_separation(xbar_c, names_c)
+                            print(f"    [SEPARATION DEBUG] choice, class {c + 1}: {culprits}")
+                            for name in culprits:
+                                k = names_c.index(name)
+                                sb = sign_breakdown(xbar_c, k)
+                                print(f"        {name:20s} rows: +{sb['positive']}  "
+                                      f"-{sb['negative']}  0:{sb['zero']}")
+                if is_sep_member and self._has_membership:
+                    for c in self._intercept_free_classes:
+                        xbar_m = self._separation_xbar_membership(c, R_last)
+                        if xbar_m.shape[0] and konis_separation_test(xbar_m)['separated']:
+                            active = np.where(self._member_mask[c] > 0)[0]
+                            names_m = [self.membership_vars[i] for i in active]
+                            culprits = attribute_separation(xbar_m, names_m)
+                            print(f"    [SEPARATION DEBUG] member, class {c + 1}: {culprits}")
+                            for name in culprits:
+                                k = names_m.index(name)
+                                sb = sign_breakdown(xbar_m, k)
+                                print(f"        {name:20s} rows: +{sb['positive']}  "
+                                      f"-{sb['negative']}  0:{sb['zero']}")
+
+            #if  converged:
+                """
+                print(f"\n{'='*70}\n[DEBUG] Full diagnostics — attempt {n_converged + 1}/{self.n_init} "
+                      f"({kind_disp}, LogLik={ll:.4f})\n{'='*70}")
+                debug_sol = dict(betas=betas, inter=inter, gamma=gamma, pi=pi, loglik=ll,
+                                  converged=converged, n_iter=n_iter, posterior=R_last,
+                                  degenerate=is_degen, separated=is_sep,
+                                  final_step=step_norm, final_delta_ll=delta_ll,
+                                  grad_choice_vecs=grad_choice_vecs, grad_member_vec=grad_member_vec)
+                #self._finalise(debug_sol, time.time() - attempt_t0)
+                #self.summarise()
+                """
+            #if getattr(self, 'debug_joint_firth', False) and converged:
+                #compare_all_three(self, betas, inter, gamma, R_last, n_steps=1)
+            if not converged:
+                continue
+
+            n_converged += 1            
+            better = (
+                best is None
+                or (best['degenerate'] and not is_degen)
+                or (is_degen == best['degenerate'] and best['separated'] and not is_sep)
+                or (is_degen == best['degenerate'] and is_sep == best['separated'] and ll > best['loglik'])
+            )
+            all_attempts.append(dict(betas=betas, inter=inter, gamma=gamma, pi=pi,
+                                      ll=ll, kind=kind, degenerate=is_degen, separated=is_sep))
+            if better:
+                best = dict(betas=betas, inter=inter, gamma=gamma, pi=pi, loglik=ll,
+                            converged=converged, n_iter=n_iter, posterior=R_last,
+                            degenerate=is_degen, separated=is_sep, final_step=step_norm, final_delta_ll=delta_ll,
+                            grad_choice_vecs=grad_choice_vecs, grad_member_vec=grad_member_vec)
+            multistart_ll.append(ll)
+            multistart_kind.append(kind)
+
+        if best is None:
+            print(f"[LC] WARNING: no candidate reached genuine convergence "
+                  f"(ftol<{self.ftol:.0e} and gtol<{self.gtol:.0e}) within "
+                  f"{max_attempts} attempts. Model marked as NOT CONVERGED.")
+            best = dict(betas=betas, inter=inter, gamma=gamma, pi=pi, loglik=ll,
+                        converged=False, n_iter=n_iter, posterior=R_last,
+                        degenerate=is_degenerate_candidate(betas, pi),
+                        separated=any(
+                            konis_separation_test(self._separation_xbar(c, betas, np.asarray(R_last)[:, c]))['separated']
+                            for c in range(len(betas))
+                        ) or (self._has_membership and any(
+                            konis_separation_test(self._separation_xbar_membership(c, R_last))['separated']
+                            for c in self._intercept_free_classes
+                        )),
+                        final_step=step_norm, final_delta_ll=delta_ll,
+                        grad_choice_vecs=grad_choice_vecs, grad_member_vec=grad_member_vec)
+        elif best['degenerate']:
+            print("[LC] WARNING: every converged multistart candidate looked "
+                  "degenerate (collapsed class share or a coefficient beyond "
+                  "the sanity bound) — the selected winner is the least-bad "
+                  "one. Consider more inits or a warm start.")
+        self.cluster_report = cluster_stability_report(self, all_attempts)          
+        self._finalise(best, time.time() - t_fit0)
+        self.multistart_loglik = multistart_ll
+        self.multistart_kind = multistart_kind
+        return self
+
+    # ------------------------------------------------------------------
+    # FINALISE: populate every attribute summarise() reads
+    # ------------------------------------------------------------------
+    def _finalise(self, best, elapsed):
+        C = self.n_classes
+        betas = [np.asarray(b) for b in best['betas']]
+        inter = np.asarray(best['inter'])
+        gamma = np.asarray(best['gamma'])
+        pi = np.asarray(best['pi'])
+        posterior = np.asarray(best['posterior'])
+
+        self.class_betas = betas
+        self.gamma_maps = []
+        _v2c = {v: i for i, v in enumerate(self.membership_vars)} if self._has_membership else {}
+        for c in range(C):
+            m = {}
+            if c in self._intercept_free_classes:
+                idx = self._intercept_free_classes.index(c)
+                m['_inter'] = float(inter[idx])
+            for v in (self.member_params_spec[c] if self.member_params_spec is not None else []):
+                col = _v2c.get(v, -1)
+                if v != '_inter' and col >= 0 and self._member_mask[c, col] > 0:
+                    m[v] = float(gamma[c, col])
+            self.gamma_maps.append(m)
+        self.posterior = posterior
+        self.class_probs = self._normalize(posterior.mean(axis=0))
+        self.loglik = float(best['loglik'])
+        self.converged = bool(best['converged'])
+        self.total_iter = int(best['n_iter'])
+        self.estim_time_sec = float(elapsed)
+        self.final_step = float(best.get('final_step', np.nan))
+        self.final_delta_ll = float(best.get('final_delta_ll', np.nan))
+        self.final_grad_choice = best.get('grad_choice_vecs', [])
+        self.final_grad_member = best.get('grad_member_vec', np.array([]))
+        _gc = max((float(np.max(np.abs(v))) for v in self.final_grad_choice if v.size), default=0.0)
+        _gm = float(np.max(np.abs(self.final_grad_member))) if self.final_grad_member.size else 0.0
+        self.gtol_res = max(_gc, _gm)
+        self.ftol_res = abs(best.get('final_delta_ll', float('nan')))
+        self.pred_prob, self.obs_prob = self._compute_prop_alts(betas, posterior)
+
+        n_inter, Km = self._n_inter, self.K_membership
+        n_gamma_dense = C * Km
+        n_gamma_active = int(self._member_mask.sum()) if self._has_membership else 0
+        n_beta = int(self._Ks.sum())
+        n_phi = C - 1
+
+        # phi: log-odds of (mean posterior) shares vs base class. Kept ONLY
+        # as a positional placeholder in se_params (summarise() hard-codes
+        # offset_cum starting at n_phi), never counted in num_params when a
+        # membership mechanism (delta) exists, since delta already IS the
+        # log-odds parameter in that case — counting both is double-counting
+        # the same quantity.
+        base_share = max(self.class_probs[self.base_class], 1e-12)
+        phi = np.array([np.log(max(self.class_probs[c], 1e-12) / base_share)
+                         for c in range(C) if c != self.base_class])
+
+        self.coeff_est = np.concatenate(betas)
+        self.coeff_names = []
+        for c in range(C):
+            for v in [self.varnames[i] for i in self._class_specs[c]]:
+                self.coeff_names.append(f"class_{c + 1}_{v}")
+
+        if self._has_membership:
+            self.num_params = n_beta + n_inter + n_gamma_active
+        else:
+            self.num_params = n_beta + n_phi
+        self.aic = 2 * self.num_params - 2 * self.loglik
+        self.bic = np.log(self.sample_size) * self.num_params - 2 * self.loglik
+        
+
+        # ---- exact joint Hessian for SE, over [phi | betas | inter | gamma_dense]
+        try:
+            self._compute_se(phi, betas, inter, gamma, n_phi, n_beta, n_inter, n_gamma_dense)
+        except Exception as exc:
+            self.se_computation_error = str(exc)
+            self.stderr = None
+            self.zvalues = None
+            self.pvalues = None
+            self.gamma_params = np.empty(0)
+            self.gamma_se = np.empty(0)
+            self.gamma_t_stats = np.empty(0)
+            self.gamma_p_values = np.empty(0)
+            self.gamma_names = []
+        return self
+
+    @staticmethod
+    def _normalize(p):
+        p = np.clip(np.asarray(p, dtype=float), 1e-12, None)
+        return p / p.sum()
+
+    def _compute_prop_alts(self, betas, posterior):
+        """Observed and posterior-weighted predicted share of each
+        alternative, counting only real (non-padded) occasions."""
+        J = self.J
+        real = self.panel_mask > 0                       # (N,P)
+        total_real = max(float(real.sum()), 1.0)
+
+        obs = np.array([float(self.y[:, :, j][real].sum()) for j in range(J)]) / total_real
+
+        pred = np.zeros(J)
+        for c in range(self.n_classes):
+            idx = self._class_specs[c]
+            Xc = self.X[:, :, :, idx]                     # (N,P,J,Kc)
+            util = np.einsum('npjk,k->npj', Xc, betas[c])
+            util = np.where(self.avail > 0, util, -1e10)
+            util = util - util.max(axis=2, keepdims=True)
+            expu = np.exp(util) * self.avail
+            denom = np.clip(expu.sum(axis=2, keepdims=True), 1e-300, None)
+            probs = expu / denom                           # (N,P,J)
+            w = posterior[:, c][:, None, None] * real[:, :, None]
+            pred += (probs * w).sum(axis=(0, 1))
+        pred = pred / total_real
+        return pred, obs
+
+    def _phi_to_pi(self, phi):
+        C = self.n_classes
+        logits = jnp.zeros(C)
+        idx_free = [c for c in range(C) if c != self.base_class]
+        for i, c in enumerate(idx_free):
+            logits = logits.at[c].set(phi[i])
+        logits = logits - jnp.max(logits)
+        p = jnp.exp(logits)
+        return p / jnp.sum(p)
+
+    def _compute_se(self, phi, betas, inter, gamma, n_phi, n_beta, n_inter, n_gamma_dense):
+        C, Km = self.n_classes, self.K_membership
+
+        def unpack(v):
+            off = n_phi
+            b = []
+            for k in self._Ks:
+                b.append(v[off:off + int(k)]); off += int(k)
+            ii = v[off:off + n_inter]; off += n_inter
+            gg = v[off:off + n_gamma_dense].reshape(C, Km) if n_gamma_dense else jnp.zeros((C, 0))
+            return b, ii, gg
+
+        def joint_negll_flat(v):
+            b, ii, gg = unpack(v)
+            if self._has_membership:
+                pi_arg = jnp.full(C, 1.0 / C)   # unused inside _estep in this branch
+            else:
+                pi_arg = self._phi_to_pi(v[:n_phi])
+            return self._joint_negll(b, ii, gg, pi_arg)
+
+        theta = np.concatenate([phi, np.concatenate(betas), inter, gamma.ravel()])
+        theta_j = jnp.asarray(theta)
+
+        H = np.asarray(hessian(joint_negll_flat)(theta_j))
+        try:
+            cov = np.linalg.inv(H)
+        except np.linalg.LinAlgError:
+            cov = np.linalg.pinv(H)
+        se_full = np.sqrt(np.clip(np.diag(cov), 0, None))
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z_full = np.where(se_full > 0, theta / se_full, np.nan)
+        p_full = 2 * (1 - _scipy_norm.cdf(np.abs(z_full)))
+        # ---- OPG/BHHH-style SE (score outer-product), para comparar contra
+        # el Hessiano puro de arriba. Reusa unpack()/theta_j ya definidos.
+        def per_individual_ll_flat(v):
+            b, ii, gg = unpack(v)
+            ll_c = self._class_ll_matrix(b)
+            if self._has_membership:
+                logH = self._membership_log_probs(ii, gg)
+            else:
+                pi_arg = self._phi_to_pi(v[:n_phi])
+                logpi = jnp.log(jnp.clip(pi_arg, MIN_COMP))
+                logH = jnp.broadcast_to(logpi[None, :], (self.N, self.n_classes))
+            num = ll_c + logH
+            return jax.scipy.special.logsumexp(num, axis=1)  # (N,) — NO sumar
+
+        try:
+            jac_fn = jax.jit(jax.jacfwd(per_individual_ll_flat))
+            jac = np.asarray(jac_fn(theta_j))              # (N, n_theta)
+            JtJ = jac.T @ jac
+            cov_opg = np.linalg.pinv(JtJ)
+            opg_se_full = np.sqrt(np.clip(np.diag(cov_opg), 0.0, None))
+        except Exception:
+            opg_se_full = np.full_like(theta, np.nan)
+
+        self.opg_se = opg_se_full
+
+        self.se_params = theta
+        self.stderr = se_full
+        self.zvalues = z_full
+        self.pvalues = p_full
+        self.se_method = "hessian (jax autodiff)"
+        self.cond_number = float(np.linalg.cond(H)) if H.size else float('nan')
+
+        gamma_start = n_phi + n_beta
+        gamma_theta = theta[gamma_start:]
+        gamma_se_d = se_full[gamma_start:]
+        gamma_t_d = z_full[gamma_start:]
+        gamma_p_d = p_full[gamma_start:]
+        gamma_opg_d = opg_se_full[gamma_start:]
+       
+
+        #gamma_names, gp, gs, gt, gpv = [], [], [], [], []
+        gamma_names, gp, gs, gt, gpv, gopg = [], [], [], [], [], []
+        for i, c in enumerate(self._intercept_free_classes):
+            gamma_names.append(f"gamma_intercept_class_{c + 1}")
+            gp.append(gamma_theta[i]); gs.append(gamma_se_d[i])
+            gt.append(gamma_t_d[i]); gpv.append(gamma_p_d[i])           
+            gopg.append(gamma_opg_d[i])
+        mem_vars = self.membership_vars or []
+        for c in range(C):
+            for k in range(Km):
+                if self._member_mask[c, k] > 0:
+                    idx = n_inter + c * Km + k
+                    gamma_names.append(f"gamma_class_{c + 1}_{mem_vars[k]}")
+                    gp.append(gamma_theta[idx]); gs.append(gamma_se_d[idx])
+                    gt.append(gamma_t_d[idx]); gpv.append(gamma_p_d[idx])
+                   
+                    gopg.append(gamma_opg_d[idx])
+
+        self.gamma_params = np.array(gp)
+        self.gamma_se = np.array(gs)
+        self.gamma_t_stats = np.array(gt)
+        self.gamma_p_values = np.array(gpv)
+        self.gamma_names = gamma_names
+        self.gamma_opg_se = np.array(gopg)
+
+        self.class_gammas = gamma_theta  # flat [inter | gamma C*Km] dense, for parity/debug
+
+        self.se_raw = np.full_like(theta, np.nan)
+        self.collin_share = np.full_like(theta, np.nan)
+        self.collin_flag = np.zeros_like(theta, dtype=bool)
+        self.class_ratio_min = np.full(C, np.nan)
+        self.class_ratio_min_abs_flag = np.zeros(C, dtype=bool)
+        self.class_ratio_min_rel_flag = np.zeros(C, dtype=bool)
+
+        H_list, se_raw_blocks = [], []
+        for c, beta_c in enumerate(betas):
+            _, g_raw, h_raw = self._class_fgh_raw[c]
+            beta_j = jnp.asarray(beta_c)
+            w_j = jnp.asarray(self.posterior[:, c])
+            H = np.asarray(h_raw(beta_j, w_j) + jnp.eye(beta_j.shape[0], dtype=beta_j.dtype) * RIDGE)
+            H_list.append(H)
+            info_inv = np.linalg.inv(H)
+            se_raw_blocks.append(np.sqrt(np.clip(np.diag(info_inv), 0, None)))
+            self.class_ratio_min[c] = np.linalg.eigvalsh(H).min() / np.linalg.eigvalsh(H).max()
+
+        rel_thresh = self._relative_thresholds(self.class_ratio_min)
+
+        offset = n_phi
+        for c, beta_c in enumerate(betas):
+            share_abs, flag_abs, _ = collinearity_diag(H_list[c], ratio_thresh=1e-3)
+            if rel_thresh[c] > 0:
+                share_rel, flag_rel, _ = collinearity_diag(H_list[c], ratio_thresh=rel_thresh[c])
+            else:
+                share_rel, flag_rel = np.zeros_like(share_abs), np.zeros_like(flag_abs)
+            self.class_ratio_min_abs_flag[c] = flag_abs.any()
+            self.class_ratio_min_rel_flag[c] = flag_rel.any()
+            kc = beta_c.shape[0]
+            self.se_raw[offset:offset + kc] = se_raw_blocks[c]
+            self.collin_share[offset:offset + kc] = np.maximum(share_abs, share_rel)
+            self.collin_flag[offset:offset + kc] = flag_abs | flag_rel
+            offset += kc
+
+        gamma_se_raw_dense = np.full(n_inter + n_gamma_dense, np.nan)
+        gamma_collin_dense = np.full(n_inter + n_gamma_dense, np.nan)
+        gamma_flag_dense = np.zeros(n_inter + n_gamma_dense, dtype=bool)
+        if self._has_membership and gamma_se_raw_dense.size > 0:
+            _, g_raw, h_raw = self._mem_fgh_raw
+            v_j = jnp.asarray(gamma_theta)
+            R_j = jnp.asarray(self.posterior)
+            H_full = np.asarray(h_raw(v_j, R_j) + jnp.eye(v_j.shape[0], dtype=v_j.dtype) * RIDGE)
+
+            # Restrict to the ACTIVE submatrix: most of the dense [inter |
+            # gamma C*Km] vector is masked (never enters the likelihood for
+            # that class), so its curvature is pure RIDGE and would hijack
+            # the smallest eigenvalue, hiding real active-parameter issues.
+            active_idx = list(range(n_inter))
+            for c in range(C):
+                for k in range(Km):
+                    if self._member_mask[c, k] > 0:
+                        active_idx.append(n_inter + c * Km + k)
+            active_idx = np.array(active_idx, dtype=int)
+
+            H_active = H_full[np.ix_(active_idx, active_idx)]
+            info_inv_active = np.linalg.inv(H_active)
+            se_raw_active = np.sqrt(np.clip(np.diag(info_inv_active), 0, None))
+            share_active, flag_active, _ = collinearity_diag(H_active)
+
+            gamma_se_raw_dense[active_idx] = se_raw_active
+            gamma_collin_dense[active_idx] = share_active
+            gamma_flag_dense[active_idx] = flag_active
+
+        gsr, gsc, gsf = [], [], []
+        for i in range(n_inter):
+            gsr.append(gamma_se_raw_dense[i])
+            gsc.append(gamma_collin_dense[i])
+            gsf.append(gamma_flag_dense[i])
+        for c in range(C):
+            for k in range(Km):
+                if self._member_mask[c, k] > 0:
+                    idx = n_inter + c * Km + k
+                    gsr.append(gamma_se_raw_dense[idx])
+                    gsc.append(gamma_collin_dense[idx])
+                    gsf.append(gamma_flag_dense[idx])
+        self.gamma_se_raw = np.array(gsr)
+        self.gamma_collin_share = np.array(gsc)
+        self.gamma_collin_flag = np.array(gsf, dtype=bool)
+
+        # ── Model-level summary: did Firth actually do real corrective
+        # work anywhere in this model, or was it just insurance? Uses the
+        # RELATIVE flag (calibrated against this dataset's own classes),
+        # not the fixed 1e-3 absolute one — already shown to flag 100% of
+        # classes indiscriminately at this dataset's natural curvature
+        # scale, so it carries no model-level signal here.
+        classes_flagged = [c for c in range(C) if self.class_ratio_min_rel_flag[c]]
+        coeff_class = np.concatenate([np.full(int(k), c) for c, k in enumerate(self._Ks)])
+        vars_flagged = [self.coeff_names[i] for i in range(len(self.coeff_names))
+                         if coeff_class[i] in classes_flagged and self.collin_flag[n_phi + i]]
+        gamma_vars_flagged = [self.gamma_names[i] for i in range(len(self.gamma_collin_flag))
+                               if self.gamma_collin_flag[i]]
+        self.firth_summary = {
+            "needed_correction": bool(classes_flagged or gamma_vars_flagged),
+            "classes_flagged": classes_flagged,
+            "choice_vars_flagged": vars_flagged,
+            "membership_vars_flagged": gamma_vars_flagged,
+        }
+        self.descr = "LCCM-Firth" if (self.choice_correction or self.membership_correction) else "LCCM"
+
+
+    @staticmethod
+    def _relative_thresholds(ratio_mins, gap_factor=100.0, min_siblings=3):
+        """Per-run threshold derived from a class's OWN sibling classes
+        (leave-one-out median / gap_factor), instead of a fixed textbook
+        constant: routine correlation among ASC-type parameters produces a
+        similar ratio_min across most classes of the same model/dataset,
+        while genuine separation stands out as an outlier against THAT
+        background. Entries with fewer than `min_siblings` comparison
+        points get 0.0 (relative check disabled there)."""
+        ratio_mins = np.asarray(ratio_mins, dtype=float)
+        n = len(ratio_mins)
+        thresh = np.zeros(n)
+        for i in range(n):
+            others = np.delete(ratio_mins, i)
+            others = others[np.isfinite(others)]
+            if len(others) >= min_siblings:
+                thresh[i] = np.median(others) / gap_factor
+        return thresh
+
+    # ------------------------------------------------------------------
+    # Panel-aware null log-likelihood (only real occasions count)
+    # ------------------------------------------------------------------
+    def get_loglik_null(self):
+        avail_counts = np.clip(self.avail.sum(axis=2), 1.0, None)   # (N,P)
+        real = self.panel_mask > 0
+        self.loglik_null = float(-np.sum(np.log(avail_counts[real])))
+        return self.loglik_null
+    
+    def class_specific_choice_shares(self):
+        """Calcula la proporción de elección de cada alternativa dentro de cada clase."""
+        J = self.J
+        K = self.n_classes
+        real = self.panel_mask > 0                     # (N,P)
+        posterior = np.asarray(self.posterior)         # (N,K)
+
+        shares = np.zeros((K, J))                      # clase x alternativa
+        for c in range(K):
+            idx = self._class_specs[c]
+            Xc = self.X[:, :, :, idx]                  # (N,P,J,Kc)
+            util = np.einsum('npjk,k->npj', Xc, self.class_betas[c])
+            util = np.where(self.avail > 0, util, -1e10)
+            util = util - util.max(axis=2, keepdims=True)
+            expu = np.exp(util) * self.avail
+            denom = np.clip(expu.sum(axis=2, keepdims=True), 1e-300, None)
+            probs = expu / denom                       # (N,P,J)
+
+            # Ponderar por la probabilidad posterior de pertenencia a la clase c
+            w = posterior[:, c][:, None, None] * real[:, :, None]
+            numerator = (probs * w).sum(axis=(0,1))    # suma sobre individuos y ocasiones
+            denominator = w.sum()
+            shares[c] = numerator / denominator        # proporción dentro de la clase
+
+        return shares
+
+
+class LatentClassConditional(LatentClass):
+    """
+    Latent Class Conditional Logit (LCCM, Vij et al. 2020).
+
+    Extends LatentClass with a second, nested decision per choice occasion:
+    given the preferred scheme (choice, y), whether it is purchased (w).
+    Both decisions share the same class-specific utility coefficients beta_s;
+    the purchase decision adds one extra, X-independent parameter per class
+    (v_s, the "no_purchase" utility), appended after beta_s. Each class's
+    parameter vector therefore has length _Ks[c] (utility coeffs) + 1 (v_s).
+
+    Reused unmodified from LatentClass: _newton, _em_step, fit's EM/SQUAREM
+    core, multistart, monotonicity back-tracking, _compute_se, membership
+    kernels and M-step. Overridden here: setup (adds w), _class_ll (adds the
+    purchase term), get_loglik_null (adds the purchase null term),
+    _compute_prop_alts (drops v_s before computing choice shares), and
+    _finalise's coeff_names tail (parent's loop doesn't know about v_s).
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.descr = "LCC-Newton"
+
+    # ------------------------------------------------------------------
+    # SETUP — delegates the panel construction of X/y/avail to
+    # LatentClass.setup(), then independently reconstructs the same
+    # (situation -> individual, slot) mapping from (ids, alts, ind_id) to
+    # place w on identical slots.
+    # ------------------------------------------------------------------
+    def setup(self, X, y, w, varnames, ids, alts, avail=None,
+              class_params_spec=None, member_params_spec=None,
+              base_class=None, panels=False, ind_id=None,
+              fit_intercept=False, base_alt=None, l1_penalty=None, l2_penalty=None):
+        """
+        w : purchase indicator, long format, constant within each choice
+            situation (1 = purchased, 0 = not purchased). Remaining
+            parameters: identical contract to LatentClass.setup().
+        """
+        ids = np.asarray(ids)
+        alts = np.asarray(alts)
+        w = np.asarray(w, dtype=float)
+
+        super().setup(
+            X=X, y=y, varnames=varnames, ids=ids, alts=alts, avail=avail,
+            class_params_spec=class_params_spec, member_params_spec=member_params_spec,
+            base_class=base_class, panels=panels, ind_id=ind_id,
+            fit_intercept=fit_intercept, base_alt=base_alt,
+            l1_penalty=l1_penalty, l2_penalty=l2_penalty,
+        )
+
+        ind_id_arr = np.asarray(ind_id) if ind_id is not None else ids
+        order = np.lexsort((alts, ids))
+        ids_s = ids[order]
+        ind_s = ind_id_arr[order]
+        w_s = w[order]
+
+        uniq_sit, counts = np.unique(ids_s, return_counts=True)
+        if np.any(counts != self.J):
+            raise ValueError("LatentClassConditional requires balanced long-format data by choice id.")
+        n_sit = len(uniq_sit)
+
+        w3 = w_s.reshape(n_sit, self.J)[:, 0]                # one value per situation
+        ind_per_sit = ind_s.reshape(n_sit, self.J)[:, 0]
+        _, inv = np.unique(ind_per_sit, return_inverse=True)
+
+        wp = np.zeros((self.N, self.P))
+        slot = np.zeros(self.N, dtype=int)
+        for s in range(n_sit):
+            i = inv[s]
+            t = slot[i]
+            wp[i, t] = w3[s]
+            slot[i] += 1
+
+        self.w = wp
+        self._wd = jnp.asarray(self.w)
+
+        # Reserve one extra, X-independent parameter per class for the
+        # purchase ("no_purchase") intercept v_s, appended after the
+        # existing utility coefficients.
+        self._Ks = self._Ks + 1
+
+        return self
+    
+
+    # ------------------------------------------------------------------
+    # KERNEL — choice (eq. 3) + purchase (eq. 7), sharing beta_x, with
+    # v_s as the last, X-independent entry of each class's beta vector.
+    # ------------------------------------------------------------------
+    def _class_ll(self, beta_active, c):
+        beta_x = beta_active[:-1]
+        v_s = beta_active[-1]
+
+        idx = jnp.asarray(self._class_specs[c])
+        Xc = jnp.take(self._Xd, idx, axis=3)                        # (N,P,J,Kc)
+        util = jnp.einsum('npjk,k->npj', Xc, beta_x)
+        util = jnp.where(self._avd > 0, util, -1e10)
+
+        # --- choice term: standard MNL over J alternatives ---
+        util_c = util - jnp.max(util, axis=2, keepdims=True)
+        expu = jnp.exp(util_c) * self._avd
+        denom = jnp.clip(jnp.sum(expu, axis=2, keepdims=True), MIN_COMP)
+        logp_choice = util_c - jnp.log(denom)
+        ll_choice = jnp.sum(self._yd * logp_choice, axis=2)         # (N,P)
+
+        # --- purchase term: binary logit, chosen-alt utility vs v_s ---
+        util_chosen = jnp.sum(self._yd * util, axis=2)              # (N,P)
+        m = jnp.maximum(util_chosen, v_s)
+        log_denom_w = m + jnp.log(jnp.exp(util_chosen - m) + jnp.exp(v_s - m))
+        logp_buy = util_chosen - log_denom_w
+        logp_nobuy = v_s - log_denom_w
+        ll_purchase = self._wd * logp_buy + (1.0 - self._wd) * logp_nobuy  # (N,P)
+
+        ll_np = ll_choice + ll_purchase
+        return jnp.sum(ll_np * self._maskd, axis=1)                 # (N,)
+
+    def _separation_xbar(self, c, betas, w_i):
+        """Purchase-stage Konis structure vectors. v_s is a scalar, not a
+        row of X (see class docstring), so the structure vector is
+        [x_chosen, -1], matching beta_active's [beta_x, v_s] layout."""
+        idx = self._class_specs[c]
+        Xc = np.asarray(self.X)[:, :, :, idx]                        # (N,P,J,Kc)
+        yc = np.asarray(self.y)                                      # (N,P,J)
+        real = np.asarray(self.panel_mask) > 0                        # (N,P)
+        w_purch = np.asarray(self.w)                                  # (N,P)
+        j_chosen = np.argmax(yc, axis=2)                               # (N,P)
+        x_chosen = np.take_along_axis(
+            Xc, j_chosen[:, :, None, None], axis=2)[:, :, 0, :]         # (N,P,Kc)
+
+        neg_one = -np.ones(x_chosen.shape[:2] + (1,))
+        x_full = np.concatenate([x_chosen, neg_one], axis=2)          # (N,P,Kc+1)
+        ytilde = 2 * w_purch - 1
+        w = w_i[:, None] * real
+        xbar = ytilde[:, :, None] * x_full
+        return (w[:, :, None] * xbar).reshape(-1, x_full.shape[-1])
+
+    # ------------------------------------------------------------------
+    # NULL LOG-LIKELIHOOD — choice (equally-likely, panel-aware) +
+    # purchase (equally-likely binary), same "random choice" convention.
+    # ------------------------------------------------------------------
+    def get_loglik_null(self):
+        avail_counts = np.clip(np.asarray(self._avd).sum(axis=2), 1.0, None)  # (N,P)
+        real = np.asarray(self._maskd) > 0
+        ll_choice_null = -np.sum(np.log(avail_counts[real]))
+        ll_purchase_null = np.log(0.5) * int(real.sum())
+        self.loglik_null = float(ll_choice_null + ll_purchase_null)
+        return self.loglik_null
+
+    # ------------------------------------------------------------------
+    # PREDICTED / OBSERVED ALTERNATIVE SHARES — choice component only;
+    # v_s never enters the choice-share computation, so it's dropped
+    # from each class's beta before computing utilities.
+    # ------------------------------------------------------------------
+    def _compute_prop_alts(self, betas, posterior):
+        J = self.J
+        real = self.panel_mask > 0
+        total_real = max(float(real.sum()), 1.0)
+
+        obs = np.array([float(self.y[:, :, j][real].sum()) for j in range(J)]) / total_real
+
+        pred = np.zeros(J)
+        for c in range(self.n_classes):
+            idx = self._class_specs[c]
+            Xc = self.X[:, :, :, idx]                     # (N,P,J,Kc)
+            beta_x = np.asarray(betas[c])[:-1]             # drop v_s
+            util = np.einsum('npjk,k->npj', Xc, beta_x)
+            util = np.where(self.avail > 0, util, -1e10)
+            util = util - util.max(axis=2, keepdims=True)
+            expu = np.exp(util) * self.avail
+            denom = np.clip(expu.sum(axis=2, keepdims=True), 1e-300, None)
+            probs = expu / denom
+            w = posterior[:, c][:, None, None] * real[:, :, None]
+            pred += (probs * w).sum(axis=(0, 1))
+        pred = pred / total_real
+        return pred, obs
+
+    # ------------------------------------------------------------------
+    # SUMMARISE — the inherited _choice_model.summarise() rebuilds each
+    # coefficient's display name via self.varnames[self._class_specs[c][k]],
+    # looping k up to self._Ks[c] (bumped +1 for v_s). Since _class_specs[c]
+    # only holds the real X-column indices (unbumped, by design — see
+    # _class_ll), that lookup goes out of bounds on the last (v_s) slot.
+    # Temporarily extend both so the base method prints "no_purchase" like
+    # any other named coefficient, then restore the originals.
+    # ------------------------------------------------------------------
+    def summarise(self, file=None, dashboard=True):
+        extra_idx = len(self.varnames)
+        varnames_ext = list(self.varnames) + ["no_purchase"]
+        specs_ext = [np.append(np.asarray(spec), extra_idx) for spec in self._class_specs]
+
+        orig_varnames, orig_specs = self.varnames, self._class_specs
+        self.varnames, self._class_specs = varnames_ext, specs_ext
+        try:
+            return super().summarise(file=file, dashboard=dashboard)
+        finally:
+            self.varnames, self._class_specs = orig_varnames, orig_specs
+
+    # ------------------------------------------------------------------
+    # FINALISE — reuses LatentClass._finalise() entirely (class_betas,
+    # class_probs, loglik, num_params, aic, bic, _compute_se all key off
+    # self._Ks, already correctly bumped); only rebuilds coeff_names,
+    # since the parent's naming loop iterates self._class_specs[c]
+    # (X columns only) and misses the extra v_s appended last per class.
+    # ------------------------------------------------------------------
+    def _finalise(self, best, elapsed):
+        super()._finalise(best, elapsed)
+
+        self.coeff_names = []
+        for c in range(self.n_classes):
+            for v in [self.varnames[i] for i in self._class_specs[c]]:
+                self.coeff_names.append(f"class_{c + 1}_{v}")
+            self.coeff_names.append(f"class_{c + 1}_no_purchase")
+
+        return self
+    
+    def class_specific_choice_shares(self):
+        """Shares por clase con dos correcciones propias del Conditional:
+        (1) durante summarise() _class_specs se extiende temporalmente con
+            un índice fake para no_purchase; hay que filtrarlo para no
+            indexar X fuera de rango.
+        (2) class_betas[c] incluye v_s (el intercept de purchase) al final,
+            que NO es una columna de X; hay que recortarlo para que el
+            einsum 'npjk,k->npj' tenga shapes compatibles.
+
+        Devuelve un array (K, J+1):
+        - columnas 0..J-1  : prob. predicha de cada alternativa (choice stage)
+        - columna  J       : purchase rate observada (peso posterior medio
+                                del indicador binario self.w, second stage)
+        summarise() solo lee las primeras J columnas (enumerate(self.alts));
+        la última se expone para callers que la necesiten (p.ej. un print
+        adicional tras el summary)."""
+        n_cols = self.X.shape[3]
+        J = self.J
+        K = self.n_classes
+        real = self.panel_mask > 0                       # (N,P)
+        posterior = np.asarray(self.posterior)           # (N,K)
+        w_obs = np.asarray(self.w)                       # (N,P) — indicador de compra
+
+        shares = np.zeros((K, J + 1))
+        for c in range(K):
+            spec = np.asarray(self._class_specs[c])
+            real_idx = spec[spec < n_cols]                # descarta el fake
+            Xc = self.X[:, :, :, real_idx]                # (N,P,J,Kc)
+            beta_x = np.asarray(self.class_betas[c])[:len(real_idx)]  # recorta v_s
+
+            # --- choice stage (igual que antes) ---
+            util = np.einsum('npjk,k->npj', Xc, beta_x)
+            util = np.where(self.avail > 0, util, -1e10)
+            util = util - util.max(axis=2, keepdims=True)
+            expu = np.exp(util) * self.avail
+            denom = np.clip(expu.sum(axis=2, keepdims=True), 1e-300, None)
+            probs = expu / denom                         # (N,P,J)
+
+            w = posterior[:, c][:, None, None] * real[:, :, None]
+            numerator = (probs * w).sum(axis=(0, 1))
+            denominator = w.sum()
+            shares[c, :J] = numerator / denominator
+
+            # --- purchase stage: media ponderada del indicador binario w_obs ---
+            w2 = posterior[:, c][:, None] * real         # (N,P)
+            mass = float(w2.sum())
+            shares[c, J] = float((w2 * w_obs).sum() / mass) if mass > 0 else float('nan')
+
+        return shares
+
+
+    def class_specific_purchase_rates(self):
+        """Conveniencia: devuelve solo la tasa de compra por clase (columna J
+        del array anterior). Útil para un print adicional tras summarise()."""
+        return self.class_specific_choice_shares()[:, self.J]
+
+
+class LatentClassWTP(LatentClassConditional):
+    """
+    LCCM estimado en espacio WTP.
+    
+    Para cada clase c, la utilidad de la alternativa j en la tarea t se
+    reparametriza como:
+    
+        U_ctj = mu_c * ( sum_{k != Cost} delta_ck * X_ctjk  -  Cost_ctj )
+    
+    con:
+        delta_ck  = WTP marginal por el atributo k (en dólares)
+        mu_c > 0  = sensibilidad al precio de la clase c
+    
+    Equivale a los coeficientes en espacio natural:
+        beta_Cost,c = -mu_c
+        beta_k,c    =  mu_c * delta_ck
+    
+    El stage de compra (v_s,c) se mantiene sin cambios respecto a
+    LatentClassConditional, pero se interpreta en las MISMAS unidades
+    escaladas que las utilidades del choice.
+    
+    El vector de parámetros por clase tiene la MISMA longitud que en el
+    padre: [delta_1, ..., delta_{Kc-1}, log_mu_c, v_s_c], donde los
+    deltas corresponden a los atributos de _class_specs[c] excepto Cost.
+    """
+    
+    def __init__(self, *args, cost_var='Cost', **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cost_var = cost_var
+        self.descr = "LCC-WTP"
+    
+    def setup(self, X, y, w, varnames, ids, alts, avail=None, **kwargs):
+        if self.cost_var not in varnames:
+            raise ValueError(
+                f"cost_var='{self.cost_var}' no encontrado en varnames."
+            )
+        
+        super().setup(X=X, y=y, w=w, varnames=varnames, ids=ids, alts=alts,
+                      avail=avail, **kwargs)
+        
+        cost_idx = varnames.index(self.cost_var)
+        self._cost_pos = []
+        for c in range(self.n_classes):
+            spec = np.asarray(self._class_specs[c])
+            mask = (spec == cost_idx)
+            if not mask.any():
+                raise ValueError(
+                    f"La clase {c} no incluye '{self.cost_var}'. "
+                    f"LatentClassWTP requiere Cost en todas las clases "
+                    f"(se usa como numeraire)."
+                )
+            self._cost_pos.append(int(np.where(mask)[0][0]))
+        
+        return self
+    
+    def _class_ll(self, beta_active, c):
+        # beta_active = [delta_1, ..., delta_{Kc-1}, log_mu_c, v_s_c]
+        Kc = len(self._class_specs[c])
+        cost_pos = self._cost_pos[c]
+        
+        deltas = beta_active[:Kc - 1]
+        log_mu = beta_active[Kc - 1]
+        v_s    = beta_active[Kc]
+        
+        mu = jnp.exp(log_mu)   # garantiza mu > 0
+        
+        # Reconstruye el vector natural-space [beta_1, ..., beta_{Kc}, v_s]
+        beta_full = jnp.zeros(Kc, dtype=beta_active.dtype)
+        non_cost_pos = [i for i in range(Kc) if i != cost_pos]
+        beta_full = beta_full.at[jnp.asarray(non_cost_pos)].set(mu * deltas)
+        beta_full = beta_full.at[cost_pos].set(-mu)
+        
+        beta_natural = jnp.concatenate([beta_full, jnp.atleast_1d(v_s)])
+        
+        return super()._class_ll(beta_natural, c)
+    
+    def get_natural_space_betas(self):
+        """Convierte la estimación WTP a espacio natural, para
+        comparaciones con LatentClassConditional estándar."""
+        natural = []
+        for c in range(self.n_classes):
+            wtp = np.asarray(self.class_betas[c])
+            Kc = len(self._class_specs[c])
+            cost_pos = self._cost_pos[c]
+            
+            deltas = wtp[:Kc - 1]
+            mu = np.exp(wtp[Kc - 1])
+            v_s = wtp[Kc]
+            
+            beta_full = np.zeros(Kc)
+            for i, pos in enumerate([i for i in range(Kc) if i != cost_pos]):
+                beta_full[pos] = mu * deltas[i]
+            beta_full[cost_pos] = -mu
+            
+            natural.append(np.concatenate([beta_full, [v_s]]))
+        return natural
+
+# =====================================================================
+# LatentClassFAST — vmap-batched multistart via jax.vmap
+# =====================================================================
+# Hereda todo de LatentClass (setup, _estep, _em_step, summarise,
+# _finalise, _compute_se, _build_kernels, diagnósticos, etc.) y solo
+# agrega un método nuevo: fit_batched(). Los n_init EM+SQUAREM corren
+# en paralelo sobre una sola GPU usando un eje inicial leading. Los
+# diagnósticos y errores estándar se calculan después sobre el ganador
+# vía _finalise.
+#
+# Uso:
+#     model = LatentClassFAST(n_classes=5, n_init=10, ...)
+#     model.setup(...)
+#     model.fit_batched(betas0=..., gamma0=..., inter0=...)
+#     model.summarise()
+
+def _fast_flatten(betas, inter, gamma, pi):
+    """[betas | inter | gamma | pi] → (n, n_total)."""
+    n = betas[0].shape[0]
+    parts = [b.reshape(n, -1) for b in betas]
+    parts.append(inter.reshape(n, -1))
+    if gamma.size > 0:
+        parts.append(gamma.reshape(n, -1))
+    parts.append(pi.reshape(n, -1))
+    return jnp.concatenate(parts, axis=1)
+
+
+def _fast_unflatten(flat, model):
+    """Inverso de _fast_flatten."""
+    n = flat.shape[0]
+    Ks = model._Ks
+    n_inter = model._n_inter
+    C = model.n_classes
+    Km = model.K_membership
+    pos = 0
+    betas = []
+    for k in Ks:
+        k_int = int(k)
+        betas.append(flat[:, pos:pos + k_int])
+        pos += k_int
+    inter = flat[:, pos:pos + n_inter]; pos += n_inter
+    if Km > 0:
+        gamma = flat[:, pos:pos + C * Km].reshape(n, C, Km)
+        pos += C * Km
+    else:
+        gamma = jnp.zeros((n, C, 0), dtype=flat.dtype)
+    pi = flat[:, pos:pos + C]
+    return betas, inter, gamma, pi
+
+
+def _fast_newton(f_j, g_j, h_j, x0, w, inner_iter, tol=1e-10):
+    """Newton de presupuesto fijo, sin control de flujo Python.
+    Seguro dentro de jax.vmap. Devuelve (x_final, any_accepted)."""
+    Kc = x0.shape[-1]
+
+    def body(carry):
+        x, any_accepted, i = carry
+        g = g_j(x, w)
+        H = h_j(x, w) + RIDGE * jnp.eye(Kc, dtype=x.dtype)
+        step_v = jnp.linalg.solve(H, g)
+        step_v = jnp.where(jnp.isfinite(step_v), step_v, jnp.zeros_like(step_v))
+        f0 = f_j(x, w)
+
+        def ls_b(c):
+            t, x_cur, accepted, j = c
+            cand = x - t * step_v
+            fc = f_j(cand, w)
+            ok = jnp.isfinite(fc) & (fc <= f0 + 1e-12)
+            x_new = jnp.where(ok, cand, x_cur)
+            return t * 0.5, x_new, ok, j + 1
+
+        def ls_c(c):
+            _, _, accepted, j = c
+            return (j < 20) & (~accepted)
+
+        _, x_ls, accepted, _ = lax.while_loop(
+            ls_c, ls_b,
+            (jnp.array(1.0, dtype=x.dtype), x,
+             jnp.array(False), jnp.array(0)),
+        )
+        x_next = jnp.where(accepted, x_ls, x)
+        return x_next, any_accepted | accepted, i + 1
+
+    def cond(carry):
+        _, _, i = carry
+        return i < inner_iter
+
+    x_final, any_accepted, _ = lax.while_loop(
+        cond, body, (x0, jnp.array(False), jnp.array(0)),
+    )
+    g_final = g_j(x_final, w)
+    gnorm = jnp.linalg.norm(g_final)
+    return x_final, any_accepted, gnorm
+
+
+def _fast_em_step(model, betas, inter, gamma, pi):
+    """Single-chain análogo de model._em_step, seguro dentro de vmap."""
+    R, ll = model._estep(betas, inter, gamma, pi)
+
+    new_betas = []
+    accepted_list = []
+    gnorm_list = []
+    for c in range(model.n_classes):
+        f_j, g_j, h_j = model._class_fgh[c]
+        x_c, acc_c, gn_c = _fast_newton(
+            f_j, g_j, h_j, betas[c], R[:, c],
+            model.newton_inner_iter,
+        )
+        new_betas.append(x_c)
+        accepted_list.append(acc_c)
+        gnorm_list.append(gn_c)
+
+    if model._has_membership and model.optimise_membership:
+        Km = model.K_membership
+        v0 = jnp.concatenate([inter, gamma.ravel()])
+        f_m, g_m, h_m = model._mem_fgh
+        v1, acc_m, gn_m = _fast_newton(
+            f_m, g_m, h_m, v0, R, model.newton_inner_iter,
+        )
+        gnorm_list.append(gn_m)
+        n_inter = model._n_inter
+        new_inter = v1[:n_inter]
+        new_gamma = v1[n_inter:].reshape(model.n_classes, Km)
+        new_pi = pi
+    else:
+        new_inter, new_gamma = inter, gamma
+        new_pi = R.mean(axis=0)
+        new_pi = new_pi / jnp.sum(new_pi)
+
+    any_accepted = jnp.stack(accepted_list).any()
+    if model._has_membership and model.optimise_membership:
+        any_accepted = any_accepted | acc_m
+
+    gnorm_max = jnp.stack(gnorm_list).max()
+
+    return new_betas, new_inter, new_gamma, new_pi, ll, R, any_accepted, gnorm_max
+
+
+class LatentClassFAST(LatentClass):
+    """
+    LatentClass con multistart vmap-batched.
+
+    Hereda todo de LatentClass. Agrega fit_batched(), que corre los
+    n_init EM+SQUAREM en paralelo sobre una sola GPU usando un eje
+    inicial leading. Los diagnósticos y errores estándar se calculan
+    después sobre el ganador vía _finalise.
+
+    Parámetros extra (respecto al padre)
+    ------------------------------------
+    max_stagnant : int
+        Número de iteraciones externas consecutivas sin que se acepte
+        ningún paso interno de Newton antes de matar una cadena. Sirve
+        para escapar del dead-lock que aparece bajo Firth block-wise
+        cuando el line search rechaza todos los pasos. Default 20.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax          # <-- esta línea
+
+    def __init__(self, *args, max_stagnant=20, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_stagnant = int(max_stagnant)
+
+    def fit_batched(self, betas0=None, inter0=None, gamma0=None,
+                    maxiter_batched=None, max_stagnant=None, verbose=True):
+        """
+        Multistart vmap-batched.
+
+        betas0, inter0, gamma0 : mismo formato que fit()
+        maxiter_batched : int, opcional (default = self.maxiter)
+        max_stagnant : int, opcional (default = self.max_stagnant)
+        verbose : bool
+        """
+        t_fit0 = time.time()
+        C = self.n_classes
+        n_init = self.n_init
+        maxiter = maxiter_batched or self.maxiter
+        max_stag = max_stagnant if max_stagnant is not None else self.max_stagnant
+
+        # Resolver betas0/inter0/gamma0 en formato dict (igual que el padre)
+        if betas0 is not None and isinstance(betas0, list) and betas0 \
+                and isinstance(betas0[0], dict):
+            rng0 = np.random.default_rng(self.random_state)
+            resolved = []
+            for c in range(self.n_classes):
+                names_c = [self.varnames[i] for i in self._class_specs[c]]
+                dom_map = betas0[c] if c < len(betas0) else {}
+                vals = [dom_map.get(v, float(rng0.normal(scale=0.05)))
+                        for v in names_c]
+                if isinstance(self, LatentClassConditional):
+                    vals.append(dom_map.get('no_purchase',
+                                             float(rng0.normal(scale=0.05))))
+                resolved.append(np.array(vals, dtype=float))
+            betas0 = resolved
+
+        if isinstance(inter0, dict):
+            inter0 = np.array([inter0.get(c, 0.0)
+                                for c in self._intercept_free_classes])
+
+        if isinstance(gamma0, list) and gamma0 and isinstance(gamma0[0], dict):
+            mem_vars = self.membership_vars or []
+            gamma_arr = np.zeros((C, self.K_membership))
+            for c in range(C):
+                dom_map = gamma0[c] if c < len(gamma0) else {}
+                for k, v in enumerate(mem_vars):
+                    if v in dom_map:
+                        gamma_arr[c, k] = dom_map[v]
+            gamma0 = gamma_arr
+
+        self._build_kernels()
+
+        # ---- construir estados iniciales batched ---------------------
+       
+        b_stacked = []
+        i_list, g_list = [], []
+        for k in range(n_init):
+            rng = np.random.default_rng(self.random_state + k)
+            if betas0 is not None:
+                if k == 0:
+                    b_k = [jnp.asarray(b) for b in betas0]
+                else:
+                    b_k = [jnp.asarray(b) + jnp.asarray(
+                        rng.normal(scale=0.05, size=np.asarray(b).shape))
+                        for b in betas0]
+            else:
+                b_k = [jnp.asarray(rng.normal(scale=0.05, size=int(kc)))
+                       for kc in self._Ks]
+            if inter0 is not None:
+                i_k = (jnp.asarray(inter0) if k == 0 else
+                       jnp.asarray(inter0) + jnp.asarray(
+                           rng.normal(scale=0.01, size=self._n_inter)))
+            else:
+                i_k = jnp.asarray(rng.normal(scale=0.01, size=self._n_inter))
+            if gamma0 is not None:
+                g_k = (jnp.asarray(gamma0) if k == 0 else
+                       jnp.asarray(gamma0) + jnp.asarray(
+                           rng.normal(scale=0.01,
+                                      size=(C, self.K_membership))))
+            else:
+                g_k = jnp.asarray(rng.normal(
+                    scale=0.01, size=(C, self.K_membership)))
+            b_stacked.append(b_k)
+            i_list.append(i_k)
+            g_list.append(g_k)
+            
+            #print(f"[FAST init {k}] "
+             #   f"betas={[np.asarray(b) for b in b_stacked[k]]} "
+              #  f"inter={np.asarray(i_list[k])} "
+               # f"gamma={np.asarray(g_list[k])}", flush=True)
+        betas_b = [jnp.stack([b_stacked[k][c] for k in range(n_init)])
+                   for c in range(C)]
+        inter_b = jnp.stack(i_list)
+        gamma_b = jnp.stack(g_list)
+        pi_b = jnp.full((n_init, C), 1.0 / C)
+        
+        # ---- vmap del paso EM single-chain ---------------------------
+        def _one_step(betas, inter, gamma, pi):
+            return _fast_em_step(self, betas, inter, gamma, pi)
+
+        step_vmapped = jax.vmap(_one_step, in_axes=([0] * C, 0, 0, 0))
+
+        def _estep_batched(betas, inter, gamma, pi):
+            def _e(b, i, g, p):
+                return self._estep(b, i, g, p)
+            return jax.vmap(_e, in_axes=([0] * C, 0, 0, 0))(
+                betas, inter, gamma, pi)
+
+        # ---- outer body: SQUAREM + kill-on-stagnation ----------------
+        def outer_body(carry):
+            (betas, inter, gamma, pi, ll_prev, done, n_stag, it) = carry
+
+            b1, i1, g1, p1, ll1, _, acc1, gn1 = step_vmapped(
+                betas, inter, gamma, pi)
+            b2, i2, g2, p2, ll2, _, acc2, gn2 = step_vmapped(b1, i1, g1, p1)
+
+            th0 = _fast_flatten(betas, inter, gamma, pi)
+            th1 = _fast_flatten(b1, i1, g1, p1)
+            th2 = _fast_flatten(b2, i2, g2, p2)
+
+            r = th1 - th0
+            v = th2 - 2.0 * th1 + th0
+            nv = jnp.linalg.norm(v, axis=-1)
+            nr = jnp.linalg.norm(r, axis=-1)
+            use_squarem = nv > 1e-14
+
+            alpha_init = jnp.minimum(-nr / jnp.maximum(nv, 1e-14),
+                                      -1.0).reshape(-1, 1)
+
+            def ls_cond(c):
+                _, _, _, accepted, j = c
+                return (j < 10) & (~jnp.all(accepted))
+
+            def ls_body(c):
+                alpha, th_acc, ll_acc, accepted, j = c
+                th_p = th0 - 2.0 * alpha * r + alpha ** 2 * v
+                bp, ip, gp, pp = _fast_unflatten(th_p, self)
+                _, ll_p = _estep_batched(bp, ip, gp, pp)
+                ok = jnp.isfinite(ll_p) & (ll_p >= ll1)
+                take = (~accepted) & ok
+                th_acc = jnp.where(take[:, None], th_p, th_acc)
+                ll_acc = jnp.where(take, ll_p, ll_acc)
+                accepted = accepted | ok
+                return (alpha - 1.0) / 2.0, th_acc, ll_acc, accepted, j + 1
+
+            _, th_acc, ll_acc, accepted, _ = lax.while_loop(
+                ls_cond, ls_body,
+                (alpha_init, th2, ll2,
+                 jnp.zeros((n_init,), dtype=bool), jnp.array(0)),
+            )
+            th_sq = jnp.where(accepted[:, None], th_acc, th2)
+            ll_sq = jnp.where(accepted, ll_acc, ll2)
+            th_final = jnp.where(use_squarem[:, None], th_sq, th2)
+            ll_final = jnp.where(use_squarem, ll_sq, ll2)
+
+            b_f, i_f, g_f, p_f = _fast_unflatten(th_final, self)
+
+            def _gn_at(b, i, g, p):
+                R, _ = self._estep(b, i, g, p)
+                gn_max = jnp.array(0.0)
+                for c in range(C):
+                    _, g_j, _ = self._class_fgh[c]
+                    gc = g_j(b[c], R[:, c])
+                    gn_max = jnp.maximum(gn_max, jnp.max(jnp.abs(gc)))
+                if self._has_membership and self.optimise_membership:
+                    _, g_m, _ = self._mem_fgh
+                    v = jnp.concatenate([i, g.ravel()])
+                    gm = g_m(v, R)
+                    gn_max = jnp.maximum(gn_max, jnp.max(jnp.abs(gm)))
+                return gn_max
+            gn_f = jax.vmap(_gn_at, in_axes=([0] * C, 0, 0, 0))(
+                b_f, i_f, g_f, p_f)
+
+            dll = jnp.abs(ll_final - ll_prev)
+            done_new = done | ((dll < self.ftol) & (gn_f < self.gtol))
+
+            step_norm = jnp.linalg.norm(th_final - th0, axis=-1)
+            stalled = step_norm < self.step_tol
+            n_stag_new = jnp.where(stalled, n_stag + 1, 0)
+            done_new = done_new | (n_stag_new >= max_stag)
+
+            already = done
+            b_f = [jnp.where(already[:, None], betas[c], b_f[c])
+                   for c in range(C)]
+            i_f = jnp.where(already[:, None], inter, i_f)
+            g_f = jnp.where(already[:, None, None], gamma, g_f)
+            p_f = jnp.where(already[:, None], pi, p_f)
+            ll_final = jnp.where(already, ll_prev, ll_final)
+            n_stag_new = jnp.where(already, n_stag, n_stag_new)
+
+            return (b_f, i_f, g_f, p_f, ll_final, done_new,
+                    n_stag_new, it + 1)
+
+        def outer_cond(carry):
+            _, _, _, _, _, done, _, it = carry
+            return (it < maxiter) & (~jnp.all(done))
+
+        ll_init = jnp.full((n_init,), -jnp.inf)
+        done_init = jnp.zeros((n_init,), dtype=bool)
+        stag_init = jnp.zeros((n_init,), dtype=jnp.int32)
+
+        (betas_f, inter_f, gamma_f, pi_f, ll_f, done_f, stag_f, it_f) = \
+            lax.while_loop(
+                outer_cond, outer_body,
+                (betas_b, inter_b, gamma_b, pi_b,
+                 ll_init, done_init, stag_init, jnp.array(0)),
+            )
+        jax.block_until_ready(ll_f)
+
+        # ---- posterior por cadena, shares, degenerados ----
+        R_all, _ = _estep_batched(betas_f, inter_f, gamma_f, pi_f)
+        shares_all = np.asarray(R_all.mean(axis=1))
+        degen_flags = np.array([is_degenerate_candidate(
+            [np.asarray(betas_f[c][k]) for c in range(C)], shares_all[k])
+            for k in range(n_init)])
+
+        # ---- per-chain Konis separation test ----
+        R_np = np.asarray(R_all)
+        sep_choice = np.zeros(n_init, dtype=bool)
+        sep_member = np.zeros(n_init, dtype=bool)
+        for k in range(n_init):
+            betas_k = [np.asarray(betas_f[c][k]) for c in range(C)]
+            for c in range(C):
+                xbar = self._separation_xbar(c, betas_k, R_np[k, :, c])
+                if xbar.shape[0] and konis_separation_test(xbar)["separated"]:
+                    sep_choice[k] = True
+                    break
+            if self._has_membership:
+                for c in self._intercept_free_classes:
+                    xbar_m = self._separation_xbar_membership(c, R_np[k])
+                    if xbar_m.shape[0] and konis_separation_test(xbar_m)["separated"]:
+                        sep_member[k] = True
+                        break
+
+        if verbose:
+            print(f"[FAST] batched EM+SQUAREM: {int(it_f)} outer iters x "
+                  f"{n_init} chains")
+            for k in range(n_init):
+                conv = bool(done_f[k]) and int(stag_f[k]) < max_stag
+                tag = "CONVERGED" if conv else (
+                    "STAGNATED" if int(stag_f[k]) >= max_stag else "STOPPED")
+                tag = f"[{tag}]"
+                if degen_flags[k]:
+                    tag += (f" [DEGENERATED: class "
+                            f"{int(np.argmin(shares_all[k])) + 1} "
+                            f"share={shares_all[k].min():.4f}]")
+                if sep_choice[k]:
+                    tag += " [SEPARATED:CHOICE]"
+                if sep_member[k]:
+                    tag += " [SEPARATED:MEMBER]"
+                print(f"  chain {k}: ll = {float(ll_f[k]):.4f}  "
+                      f"n_stag = {int(stag_f[k])}  {tag}")
+
+            for k in range(n_init):
+                if sep_choice[k]:
+                    betas_k = [np.asarray(betas_f[c][k]) for c in range(C)]
+                    for c in range(C):
+                        xbar = self._separation_xbar(c, betas_k, R_np[k, :, c])
+                        if xbar.shape[0] and konis_separation_test(xbar)["separated"]:
+                            names_c = [self.varnames[i] for i in self._class_specs[c]]
+                            culprits = attribute_separation(xbar, names_c)
+                            print(f"    chain {k} SEPARATED:CHOICE class {c+1}: {culprits}")
+                if sep_member[k] and self._has_membership:
+                    for c in self._intercept_free_classes:
+                        xbar_m = self._separation_xbar_membership(c, R_np[k])
+                        if xbar_m.shape[0] and konis_separation_test(xbar_m)["separated"]:
+                            active = np.where(self._member_mask[c] > 0)[0]
+                            names_m = [self.membership_vars[i] for i in active]
+                            culprits = attribute_separation(xbar_m, names_m)
+                            print(f"    chain {k} SEPARATED:MEMBER class {c+1}: {culprits}")
+
+        # ---- winner: clean (no degenerada, sin separación) ----
+        LL_TOL = 50.0
+        best_overall_idx = int(np.argmax(np.asarray(ll_f)))
+        best_overall_ll  = float(ll_f[best_overall_idx])
+
+        eligible = np.where(~degen_flags & ~sep_choice & ~sep_member)[0]
+        if eligible.size == 0:
+            eligible = np.where(~degen_flags)[0]
+            if verbose and eligible.size == 0:
+                print("[FAST] WARNING: all chains degenerate; "
+                      "picking best ll (least-bad).")
+
+        if eligible.size == 0:
+            winner = best_overall_idx
+        else:
+            best_elig = int(eligible[np.argmax(np.asarray(ll_f)[eligible])])
+            gap = best_overall_ll - float(ll_f[best_elig])
+            if gap <= LL_TOL:
+                winner = best_elig
+            else:
+                if verbose:
+                    print(f"[FAST] best clean chain is {gap:.1f} ll worse than "
+                          f"global best; picking global best.")
+                winner = best_overall_idx
+
+        if verbose:
+            flags = []
+            if degen_flags[winner]: flags.append("DEGENERATED")
+            if sep_choice[winner]: flags.append("SEPARATED:CHOICE")
+            if sep_member[winner]: flags.append("SEPARATED:MEMBER")
+            tag = "CLEAN" if not flags else " ".join(flags)
+            print(f"[FAST] winner = chain {winner}  "
+                  f"(ll={float(ll_f[winner]):.4f}, {tag})")
+
+        self.multistart_separation_choice = sep_choice.tolist()
+        self.multistart_separation_member = sep_member.tolist()
+
+        betas_w = [np.asarray(betas_f[c][winner]) for c in range(C)]
+        inter_w = np.asarray(inter_f[winner])
+        gamma_w = np.asarray(gamma_f[winner])
+        pi_w    = np.asarray(pi_f[winner])
+
+        R_w, _ = self._estep(
+            [jnp.asarray(b) for b in betas_w],
+            jnp.asarray(inter_w), jnp.asarray(gamma_w), jnp.asarray(pi_w))
+
+        # gradientes finales en el ganador
+        grad_choice_vecs = []
+        for c in range(C):
+            _, g_j, _ = self._class_fgh[c]
+            w_c = jnp.asarray(R_w[:, c])
+            grad_choice_vecs.append(
+                np.asarray(g_j(jnp.asarray(betas_w[c]), w_c))
+            )
+        if self._has_membership:
+            _, g_m, _ = self._mem_fgh
+            v_m = jnp.concatenate([jnp.asarray(inter_w),
+                                    jnp.asarray(gamma_w).ravel()])
+            grad_member_vec = np.asarray(g_m(v_m, jnp.asarray(R_w)))
+        else:
+            grad_member_vec = np.array([])
+
+        best = dict(
+            betas=betas_w, inter=inter_w, gamma=gamma_w, pi=pi_w,
+            loglik=float(ll_f[winner]),
+            converged=bool(done_f[winner]
+                           and int(stag_f[winner]) < max_stag),
+            n_iter=int(it_f),
+            posterior=np.asarray(R_w),
+            final_delta_ll=0.0,
+            final_step=0.0,
+            grad_choice_vecs=grad_choice_vecs,
+            grad_member_vec=grad_member_vec,
+        )
+        self._finalise(best, time.time() - t_fit0)
+        self.multistart_loglik = [float(x) for x in np.asarray(ll_f)]
+        self.multistart_kind = ["batched"] * n_init
+        return self
+class LatentClassNormalizedFAST(LatentClassFAST):
+    """
+    LatentClassFAST con normalización por escala de columnas (sin centrado,
+    para no tener que ajustar v_s en el stage de compra de Conditional).
+
+    X_norm = X / sigma_k   (sigma_k = std(X[:,k]), ASC → sigma=1)
+
+    EM corre en espacio normalizado. Al terminar, _finalise:
+      1) back-transforma betas y gamma a escala original
+      2) swappea self.X → self.X_orig y recompila kernels
+      3) llama a super()._finalise(), que computa Hessiano, SEs, VDP,
+         ratio_min y Konis sobre el Hessiano RAW en escala ORIGINAL
+    Después de _finalise, todo el modelo queda en escala original de forma
+    consistente (X, class_betas, gamma, kernels).
+    """
+
+    def setup(self, X, y, varnames, ids, alts, avail=None, **kwargs):
+        varnames_list = list(varnames)
+        X_arr = np.asarray(X, dtype=float)
+
+        asc_mask = np.array([
+            str(v).startswith("intercept.") or str(v) == "intercept"
+            for v in varnames_list
+        ])
+
+        sigma = np.ones(X_arr.shape[1])
+        for k in range(X_arr.shape[1]):
+            if asc_mask[k]:
+                continue
+            s = float(np.std(X_arr[:, k]))
+            if s > 1e-12:
+                sigma[k] = s
+
+        self._norm_sigma    = sigma
+        self._norm_asc_mask = asc_mask
+
+        X_norm = X_arr / sigma[None, :]
+
+        super().setup(X=X_norm, y=y, varnames=varnames, ids=ids, alts=alts,
+                      avail=avail, **kwargs)
+
+        # self.X ya está (N, P, J, K) → reconstruir escala original
+        self._X_orig_3d = self.X * sigma[None, None, None, :]
+
+        self._class_sigma = [
+            sigma[self._class_specs[c]] for c in range(self.n_classes)
+        ]
+
+        if self._has_membership and self.K_membership > 0:
+            mem_idx = [varnames_list.index(v) for v in self.membership_vars]
+            self._mem_sigma = sigma[mem_idx]
+            self._X_membership_orig = self.X_membership * self._mem_sigma[None, :]
+        else:
+            self._mem_sigma = np.ones(0)
+            self._X_membership_orig = None
+
+        return self
+
+    def _finalise(self, best, elapsed):
+        is_cond = isinstance(self, LatentClassConditional)
+
+        betas_orig = []
+        for c in range(self.n_classes):
+            b = np.asarray(best['betas'][c])
+            sig_c = self._class_sigma[c]
+            if is_cond:
+                # último elemento es v_s (no columna de X) → sin escala
+                betas_orig.append(np.concatenate([b[:-1] / sig_c, b[-1:]]))
+            else:
+                betas_orig.append(b / sig_c)
+
+        if best.get('gamma') is not None and self.K_membership > 0:
+            gamma_orig = np.asarray(best['gamma']) / self._mem_sigma[None, :]
+        else:
+            gamma_orig = best.get('gamma')
+
+        # swap permanente a escala original (EM ya terminó)
+        self.X = self._X_orig_3d
+        self._Xd = jnp.asarray(self.X)
+        if self._has_membership and self._X_membership_orig is not None:
+            self.X_membership = self._X_membership_orig
+            self._Zmd = jnp.asarray(self.X_membership)
+        self._build_kernels()   # kernels capturan _Xd original
+
+        best_orig = dict(best)
+        best_orig['betas'] = betas_orig
+        best_orig['gamma'] = gamma_orig
+
+        super()._finalise(best_orig, elapsed)
+        return self

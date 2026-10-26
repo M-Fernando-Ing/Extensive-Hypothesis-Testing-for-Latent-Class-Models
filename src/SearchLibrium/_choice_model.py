@@ -1,0 +1,2023 @@
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+IMPLEMENTATION: BASE CLASS FOR LOGIT MODELS 
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+import logging
+
+"""
+BACKGROUND - Choice Modelling
+
+ISVARS: In choice modeling, an individual-specific variable refers to a characteristic or attribute 
+of an individual that is specific to that individual and influences their decision-making process.
+These variables are typically included in choice models to capture heterogeneity or differences 
+among individuals in their preferences or behavior.
+
+Individual-specific variables are used in choice modeling to account for variations in preferences 
+or behaviors that cannot be explained solely by the attributes of the alternatives being considered.
+
+ASVARS: In choice modeling, an alternative-specific variable refers to a characteristic or attribute
+of a specific alternative that may influence the decision-making process of individuals when choosing 
+among available options. These variables are included in choice models to capture the effects of
+attributes that vary across alternatives and affect individuals' preferences for those alternatives.
+
+Examples of alternative-specific variables in choice modeling may include attributes such as price, 
+brand, product features, location, or availability. These variables can represent both observable
+characteristics of alternatives (e.g., price) and unobservable characteristics that may influence 
+preferences (e.g., brand reputation).
+ 
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
+''' ----------------------------------------------------------- '''
+'''  MAIN PARAMETERS:                                           '''
+''' ----------------------------------------------------------- '''
+# N : Number of choice situations
+# P : Number of observations per panels
+# J : Number of alternatives
+# K : Number of variables (Kf: fixed, non-trans, Kr: random, non-trans,
+#        Kftrans: fixed, trans, Krtrans: random, trans)
+
+''' ---------------------------------------------------------- '''
+''' UNUSED LIBRARIES                                           '''
+''' ---------------------------------------------------------- '''
+#import logging
+
+''' ---------------------------------------------------------- '''
+''' LIBRARIES                                                  '''
+''' ---------------------------------------------------------- '''
+import warnings
+from abc import ABC #, abstractmethod
+from time import time
+import numpy as np
+import pandas as pd
+import scipy.stats as ss
+import jax.numpy as jnp
+
+
+
+
+try:
+    from .boxcox_functions import boxcox_param_deriv, boxcox_transformation, truncate, truncate_lower
+    from ._device import device as dev
+    
+except ImportError:
+    from boxcox_functions import boxcox_param_deriv, boxcox_transformation, truncate, truncate_lower
+    from _device import device as dev
+    
+
+#library for keeping track of variables
+#from watchpoints import watch
+
+# A dictionary to manage backends
+BACKENDS = {
+    "numpy": np,
+    "jax": jnp,
+}
+
+# Utility function to select the backend
+def get_backend(jax=True):
+    """
+    Return the appropriate backend (jax.numpy or numpy).
+
+    Args:
+        jax (bool): If True, use JAX. Otherwise, use NumPy.
+
+    Returns:
+        module: The selected backend module.
+    """
+    return BACKENDS["jax"] if jax else BACKENDS["numpy"]
+
+
+''' ---------------------------------------------------------- '''
+''' CLASS FOR ESTIMATION OF DISCRETE CHOICE MODEL              '''
+''' ---------------------------------------------------------- '''
+class DiscreteChoiceModel(ABC):
+# {
+    """ Docstring """
+
+    # ===================
+    # CLASS PARAMETERS
+    # ===================
+
+    """
+    coeff_est:  Coefficient estimates
+    """
+
+    # ===================
+    # CLASS FUNCTIONS
+    # ===================
+
+    """
+    1. void __init__(self);
+    2. void fit(self);
+    3. void reset_attributes(self);
+    4.  set_asarray(self, X, y, varnames, alts, isvars, transvars, ids, weights, panels, avail);
+    5. void pre_process(self, alts, varnames, isvars, transvars, base_alt, fit_intercept, transformation,
+                maxiter, panels=None, correlated_vars=None, randvars=None);
+    6. void post_process(self, result, coeff_names, sample_size, hess_inv=None);
+    7. X, names <-- setup_design_matrix(self, X);
+    8.  check_long_format_consistency(self, ids, alts, sorted_idx);
+    9. X, y, panels <-- arrange_long_format(self, X, y, ids, alts, panels=None);
+    10. void validate_inputs(self, X, y, alts, varnames, isvars, ids, weights,
+                         panels, base_alt, fit_intercept, maxiter);
+    11. loglik <-- get_loglik_null(self);
+    12. void summarise(self);
+    13. void print_matrix(self, str_mat, descr);
+    14. str_mat <-- setup_print(self, mat);
+    15. void  print_mat(self, mat, descr);
+    16. pch_res <-- fitted(self, type="parameters");
+    17. void  print_stdev(self, stdevs, names);
+    18. void  compute_stddev(self);
+    """
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    def reset_attributes(self): # {
+        self.coeff_names, self.coeff_est  = None, None
+        self.stderr, self.zvalues = None, None
+        self.pvalues, self.loglik = None, None
+        self.total_fun_eval = 0
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    def __init__(self, jax = True):
+    # {
+
+        self.reset_attributes()
+        self.fit_intercept = False
+        self.reg_penalty = 0.00  # L2 penalty strength (ridge)
+        self.l1_penalty  = 0.1   # L1 penalty strength (lasso)
+        self.pval_penalty = 5
+        logging.info(f'pval penalty set to {self.pval_penalty}')
+        # NOTE: The reg_penalty value is tricky to define. If too high, convergence is restricted.
+        #  Set to zero to turn off. A value of 1 seems too high.
+
+        # Variables used in derived classes and were previously not defined in this class:
+        self.obs_prob = 0
+        self.Xnames = None
+        self.ordered_varnames = None
+        self.covariance_matrix, self.betas = None, None
+
+        # Define constants:
+        self.ftol, self.gtol = 1e-7, 1e-5
+        self.maxiter = 2000
+
+        # Define boolean flags:
+        self.converged = False
+        self.return_grad, self.return_hess, self.fit_intercept = True, True, False
+        self.scipy_optimisation = True
+        self.method, self.transformation = "slsqp", "boxcox"
+
+        self.trans_func = None      # NEW. CHECK VALIDITY!
+        self.varnames, self.isvars, self.transvars = None, None, None
+        self.base_alt, self.alts, self.panels = None, None, None
+        self.bic, self.aic, self.mae = None, None, None  # Metrics
+        self.loglik = None
+
+        # Initialise empty arrays
+        self.fxidx, self.fxtransidx = [], []
+        self.X, self.y = [], []
+        self.X_original, self.y_original = [], []
+        self.weights, self.avail = [], []
+        self.init_coeff = []
+        self._jax = jax
+        self.backend = get_backend(jax)
+        self.descr = ""
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Virtual                                          '''
+    ''' ---------------------------------------------------------- '''
+    #@abstractmethod
+    def fit(self): # {
+        pass
+    # }
+
+    @staticmethod
+    def add_single_intercept(data, varnames = None):
+        # Check if data is a NumPy array
+        if isinstance(data, np.ndarray):
+            # Add intercept as a new column (prepend or append)
+            intercept_col = np.ones((data.shape[0], 1))  # Column of ones
+            if "intercept" not in varnames:  # Handle both DataFrame and ndarray
+                data = np.hstack([intercept_col, data])  # Append intercept for NumPy arrays
+        elif isinstance(data, pd.DataFrame):
+            # Check and add intercept for DataFrames
+            if "intercept" not in data.columns:
+                data.insert(0, "intercept",1)  # Add intercept column
+
+        else:
+            raise TypeError("Data must be a NumPy array or Pandas DataFrame")
+
+
+        return data
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Convert to numpy arrays                          '''
+    ''' ---------------------------------------------------------- '''
+    def set_asarray(self, X, y, varnames, alts, isvars, transvars, ids, weights, panels, avail): # {
+        if self.fit_intercept:
+            X = self.add_single_intercept(X, varnames)
+
+        X = np.asarray(X)
+        y = np.asarray(y)
+        varnames = np.asarray(varnames, dtype="<U64") if varnames is not None else None
+        if self.fit_intercept:
+            if varnames is not None:
+                if "intercept" not in varnames:
+                    varnames = np.insert(varnames, 0, "intercept")  # Insert '_inter' into the first
+
+
+            else:
+                # Initialize varnames with only "_inter" if varnames is None
+                varnames = np.array(["intercept"], dtype="<U64")
+                #print("'_inter' added as the first item in varnames.")
+        alts = np.asarray(alts) if alts is not None else None
+        isvars = np.asarray(isvars, dtype=object) if isvars is not None else np.array([])
+        if self.fit_intercept and "intercept" not in isvars:
+            isvars = np.insert(isvars, 0, "intercept")
+        transvars = np.asarray(transvars, dtype="<U64") if transvars is not None else []
+        ids = np.asarray(ids) if ids is not None else None
+        weights = np.asarray(weights) if weights is not None else None
+        panels = np.asarray(panels) if panels is not None else None
+        avail = np.asarray(avail) if avail is not None else None
+        return X, y, varnames, alts, isvars, transvars, ids, weights, panels, avail
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function to assign the penalty of the regularisation       '''
+    ''' ---------------------------------------------------------- '''
+    def reassign_penalty(self, penalty = 0):
+        self.reg_penalty = penalty
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Initialise member variables                      '''
+    ''' ---------------------------------------------------------- '''
+    def pre_process(self, alts, varnames, isvars, transvars, base_alt, fit_intercept, transformation,
+                maxiter = 2000, panels=None, correlated_vars=None, randvars=None):
+    # {
+        self.reset_attributes()
+        self.fit_start_time = time()  # Set the start time for runtime calculation
+        self.isvars = [] if isvars is None else isvars
+        self.transvars = [] if transvars is None else transvars
+        self.randvars = [] if randvars is None else randvars
+
+        
+        self.asvars = [v for v in varnames if ((v not in self.isvars) and 
+                                               #(v not in self.transvars) and 
+                                               (v not in self.randvars))] 
+
+        #todo check asvars, if asvars
+
+        # old definition of asvars used to make datasets
+        self.asvars_construct_matrix = [v for v in varnames if v not in self.isvars]
+        self.randtransvars, self.fixedtransvars = [], []
+
+
+        _, idx = np.unique(alts, return_index=True)
+        self.alts = alts[np.sort(idx)]   # Extract unique alternatives from the data # but keep the order of the actual data.
+
+
+        self.varnames = list(varnames)  # Easier to handle with lists
+        self.fit_intercept = fit_intercept
+
+        self.transformation = transformation
+        self.base_alt = self.alts[0] if base_alt is None else base_alt
+        self.correlated_vars = False if correlated_vars is None else correlated_vars
+        self.maxiter = maxiter
+
+        # Assign panels to self.panels if self.panels attribute does not exist
+        self.panels = getattr(self, 'panels', panels) # i.e., if not hasattr(self, 'panels'): self.panels = panels
+    # }
+
+
+
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' convert hess inverse for L-BFGS-B optimisation method      '''
+    ''' ---------------------------------------------------------- '''
+    def post_process(self, result, coeff_names, sample_size, hess_inv=None):
+    # {
+        self.converged = result.success
+        self.coeff_est = result.x
+        self.loglik = -result.fun
+        self.total_iter = result.nit
+
+        self.estim_time_sec = time() - self.fit_start_time
+        self.sample_size = sample_size
+        self.num_params = self.Kbw + self.Kchol + self.Kf + self.Kftrans + self.Kr + self.Krtrans
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute stderr
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        self.stderr = np.zeros_like(self.coeff_est)
+        std_err_estimated = False
+
+        if 'stderr' in result:  # {
+            std_err_estimated = True
+            self.stderr = result['stderr']
+        # }
+
+
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Define coeff_names
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+        self.coeff_names = coeff_names
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute stderr
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Hinv_exists = (hasattr(self,'Hinv') and not self.Hinv is None)
+        if Hinv_exists:
+        # {
+            if dev.using_gpu:
+                self.stderr = np.sqrt(np.abs(np.diag(self.Hinv)))
+            else:
+            # {
+                diag_arr_tmp = np.diag(np.array(self.Hinv))
+
+                # stop runtime warnings from (very small) negative values
+                # assume these occur from some floating point error and are 0.
+
+                pos_vals_idx = [ii for ii, el in enumerate(diag_arr_tmp) if el > 0]
+                diag_arr = np.zeros(len(diag_arr_tmp))
+                diag_arr[pos_vals_idx] = diag_arr_tmp[pos_vals_idx]
+                self.stderr = np.sqrt(np.abs(diag_arr))
+            # }
+
+            std_err_estimated = False if np.isnan(self.stderr).any else True
+        # }
+
+        if not std_err_estimated:
+        # {
+            if self.method == "bfgs":
+                self.stderr = np.sqrt(np.abs(np.diag(result.hess_inv)))
+                std_err_estimated = True
+
+            if self.method == "l-bfgs-b":
+                hess = result['hess_inv'].todense()
+                self.stderr = np.sqrt(np.abs(np.diag(np.array(hess))))
+                std_err_estimated = True
+        # }
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Fallback: some models (e.g. MixedLogit with the default
+        # "slsqp" method) compute and stash a numerical Hessian inverse
+        # directly on the result dict (result['hess_inv']) instead of
+        # setting self.Hinv or using scipy's bfgs/l-bfgs-b machinery.
+        # The two checks above only recognise "bfgs"/"l-bfgs-b", so without
+        # this fallback self.stderr silently stays all-zero for every other
+        # method even though a usable Hessian was already computed.
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if not std_err_estimated and 'hess_inv' in result and result['hess_inv'] is not None:
+        # {
+            hess_inv = result['hess_inv']
+            hess_inv = hess_inv.todense() if hasattr(hess_inv, 'todense') else hess_inv
+            diag_arr_tmp = np.diag(np.array(hess_inv))
+            pos_vals_idx = [ii for ii, el in enumerate(diag_arr_tmp) if el > 0]
+            diag_arr = np.zeros(len(diag_arr_tmp))
+            diag_arr[pos_vals_idx] = diag_arr_tmp[pos_vals_idx]
+            self.stderr = np.sqrt(np.abs(diag_arr))
+            std_err_estimated = not np.isnan(self.stderr).any()
+        # }
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute lambda_mask (for nested logit models)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Lambda parameters are tested against H0=1 (not H0=0)
+        # because lambda represents nesting strength (1=standard logit)
+        lambda_mask = [1 if "lambda" in x else 0 for x in coeff_names]
+
+        # If length mismatch, pad with 0s (assume non-lambda params for extras)
+        if len(lambda_mask) != len(self.coeff_est):
+            lambda_mask = np.concatenate([
+                lambda_mask,
+                np.zeros(len(self.coeff_est) - len(lambda_mask))
+            ])
+
+
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute z-values
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        with np.errstate(divide='ignore', invalid='ignore'):
+            self.zvalues = np.nan_to_num((self.coeff_est - lambda_mask) / self.stderr)
+        self.zvalues = truncate(self.zvalues, -1e+5, 1e+5)  # Set maximum (and minimum) limits
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute pvalues
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if sample_size < 100:  # arbitrary ... could do standard 30
+            self.pvalues = 2 * (1 - ss.t.cdf(np.abs(self.zvalues), df=sample_size))
+        else:
+            self.pvalues = 2 * (1 - ss.norm.cdf(np.abs(self.zvalues)))
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute Number of Non-Significant pvalues
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        non_sigs = self.num_of_exceeding_pvalues(self.pvalues, 0.0)
+        #print('log like is before', self.loglik)
+        self.loglik -= non_sigs*self.pval_penalty # penalise the non-sigs
+        logging.info('applying pval')
+        #print('log like is', self.loglik)
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Compute aic and bic
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        num_params = len(self.coeff_est)
+
+
+
+        self.aic = 2 * num_params - 2 * self.loglik
+        self.bic = np.log(sample_size) * num_params - 2 * self.loglik
+       
+
+
+    # }
+
+    def num_of_exceeding_pvalues(self, pvalues, threshold):
+        """
+        :param pvalues: array of pvalues
+        :type pvalues:float
+        :param threshold: signficant values for hypothesis testing
+        :type threshold: float
+        :return: int
+        """
+        return len([p for p in pvalues if p > threshold])
+
+
+    ''' ------------------------------------------------------------------------ '''
+    ''' Function. Setup and reshape input data after adding isvars and intercept '''
+    ''' ------------------------------------------------------------------------ '''
+    def setup_design_matrdix(self, X):
+    # {
+        """ Setup the design matrix by adding the intercept when necessary and
+        converting the isvars to a dummy representation that removes the base alternative """
+
+        self.J = getattr(self, 'J', len(self.alts)) # i.e., if not hasattr(self, 'J'): self.J = len(self.alts)
+        self.N = int(len(X) / self.J)
+        self.P = 0
+
+        P_N = self.N
+        J = self.J
+        N = self.N
+
+        if self.panels is not None:
+        # {
+            # Identify and count unique values. Return two arrays
+            unique_values, counts = np.unique(self.panels, return_counts=True)
+
+            self.N = len(unique_values) # Set N as the number of unique values
+            normalized_counts = counts / self.J # Normalize counts by dividing by self.J
+            self.P_i = normalized_counts.astype(int) # Convert scaled counts to integers
+
+            # Assumption of itegrality. Should check if any element is not an integer!
+
+            self.P = np.max(self.P_i)   # Identify and store maximum element
+        # }
+        else:
+        # {
+            self.P = 1
+            self.P_i = np.ones([self.N]).astype(int)
+        # }
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # MAKE COPIES
+        isvars = self.isvars.copy()
+        asvars = self.asvars.copy()
+        asvars_construct_matrix = self.asvars_construct_matrix.copy()
+        randvars = self.randvars.copy()
+        randtransvars = self.randtransvars.copy()
+        fixedtransvars = self.fixedtransvars.copy()
+        varnames = self.varnames.copy()
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        self.varnames = np.array(varnames, dtype="<U64")
+        lst = self.varnames.tolist()
+        #print(lst)
+        ispos = [lst.index(str) for str in self.isvars if str in lst]  # Position of IS vars
+        #print('is pos is ', ispos)
+        #print('and X is', X)
+        ispos_old = [self.varnames.tolist().index(i) for i in self.isvars]  # Position of IS va
+        # adjust index array to include isvars
+        if len(self.isvars) > 0 and not hasattr(self, 'ispos'):  # check not done before...
+        # {
+
+
+            nbFalse = len(self.isvars) * (J - 1)  # Calculate the number of False values to insert
+
+            # Creates a masked version of the boolean array fxidx_bool based on indices not present in the array ispos
+            fxidx_bool = np.array(self.fxtransidx, dtype="bool") # Convert elements to booleans
+            indices = np.arange(len(fxidx_bool)) # Array of indices from 0 to len(fxidx_bool) - 1.
+            mask = np.isin(indices, ispos) # True indicates that the element from indices is in ispos, and False indicates it is not.
+            fxidx_bool_masked = fxidx_bool[~mask] # negated_mask = ~mask
+            self.fxidx = np.insert(fxidx_bool_masked, 0, np.repeat(True, nbFalse))# Insert True values
+
+            fxtransidx_bool = np.array(self.fxtransidx, dtype="bool")  # Convert elements to booleans
+            indices= np.arange(len(fxtransidx_bool))
+            mask = np.isin(indices, ispos)
+            fxtransidx_bool_masked = fxtransidx_bool[~mask]
+            self.fxtransidx = np.insert(fxtransidx_bool_masked, 0, np.repeat(False, nbFalse)) # Insert False values
+
+            if hasattr(self, 'rvidx'):
+            # {
+                rvidx_bool = np.array(self.rvidx, dtype=bool) # Convert self.rvidx to boolean array if it's not already
+                indices = np.arange(len(rvidx_bool))
+                mask = np.isin(indices, ispos)
+                rvidx_bool_masked = rvidx_bool[~mask]
+                self.rvidx = np.insert(rvidx_bool_masked, 0, np.repeat(False, nbFalse)) # Insert False values
+            # }
+
+            if hasattr(self, 'rvtransidx'):
+            # {
+                rvtransidx_bool = np.array(self.rvtransidx, dtype=bool)  # Convert self.rvidx to boolean array if it's not already
+                indices = np.arange(len(rvtransidx_bool))
+                mask = np.isin(indices, ispos)
+                rvtransidx_bool_masked = rvtransidx_bool[~mask]
+                self.rvtransidx = np.insert(rvtransidx_bool_masked, 0, np.repeat(False, nbFalse))  # Insert False values
+            # }
+        # }
+
+        if self.transformation == "boxcox": # {
+            self.trans_func = boxcox_transformation
+            self.transform_deriv = boxcox_param_deriv
+        # }
+
+        S = np.zeros((self.N, self.P, self.J))
+        for i in range(self.N):
+            S[i, 0:self.P_i[i], :] = 1
+
+        self.S = S
+
+        lst = self.varnames.tolist()
+        self.ispos = [lst.index(str) for str in self.isvars if str in lst]  # Position of isvars in varnames
+        self.aspos = [lst.index(str) for str in asvars_construct_matrix if str in lst]  # Position of asvars in varnames
+        randpos = [lst.index(str) for str in randvars if str in lst]  # Position of randvars
+        randtranspos = [lst.index(str) for str in randtransvars if str in lst]  # bc transformed variables with random coeffs
+        fixedtranspos = [lst.index(str) for str in fixedtransvars if str in lst]  # bc transformed variables with fixed coeffs
+
+        self.correlationpos = []
+        if randvars:
+            self.correlationpos = [lst.index(str) for str in self.varnames if str in self.randvars]  # Position of correlated variables within randvars
+
+        if (isinstance(self.correlated_vars, list)):
+        #{
+            self.correlationpos = [lst.index(str) for str in self.varnames if str in self.correlated_vars]
+            self.uncorrelatedpos = [lst.index(str) for str in self.varnames if str not in self.correlated_vars]
+        #}
+
+        self.Kf = sum(self.fxidx)           # Set number of fixed coeffs from idx
+        self.Kr = len(randpos)              # Number of random coefficients
+        self.Kftrans = len(fixedtranspos)   # Number of fixed coefficients of bc transformed vars
+        self.Krtrans = len(randtranspos)    # Number of random coefficients of bc transformed vars
+        self.Kchol = 0                      # Number of random beta cholesky factors
+        self.correlationLength = 0
+        self.Kbw = self.Kr
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # set up length of betas required to estimate correlation and/or
+        # random variable standard deviations, useful for cholesky matrix
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        if (self.correlated_vars):
+        # {
+            if (isinstance(self.correlated_vars, list)):
+            # {
+                nb_corvars = len([v for v in self.correlated_vars if v in randvars])
+                self.correlationLength = nb_corvars
+                self.Kbw = self.Kr - nb_corvars
+                self.Kchol = int((nb_corvars * (nb_corvars + 1)) / 2)
+                # i.e., Kchol => # permutations of specified params in correlation list
+            # }
+            else: # {
+                self.correlationLength = self.Kr
+                self.Kbw = 0
+                nb_randvars = len(self.randvars)
+                self.Kchol = int((nb_randvars * (nb_randvars + 1)) / 2)
+                # i.e., correlated_vars = True, Kchol => permutations of rand vars
+            # }
+        # }
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Create design matrix for individual specific variables
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Xis = None
+        if len(self.isvars):
+        # {
+            # Create a dummy individual specific variables for the alts
+            dummy = np.tile(np.eye(J), reps=(P_N, 1))
+
+            # Remove base alternative
+            dummy = np.delete(dummy, np.where(self.alts == self.base_alt)[0], axis=1)
+            Xis = X[:, self.ispos]
+
+
+            if Xis.dtype == np.object_:
+                Xis_numeric = pd.to_numeric(Xis.flatten(), errors='coerce').reshape(Xis.shape)
+                Xis = Xis_numeric
+
+
+            # Multiply dummy representation by the individual specific data
+            try:
+
+                Xis = np.einsum('nj,nk->njk', Xis, dummy, dtype="float64")
+            except:
+                Xis_numeric = pd.to_numeric(Xis.flatten(), errors='coerce').reshape(Xis.shape)
+                Xis = Xis_numeric
+                Xis = np.einsum('nj,nk->njk', Xis, dummy, dtype="float64")
+                # Example of filtering out non-numeric data
+                #Xis = np.array([x for x in Xis if isinstance(x, (int, float))], dtype='float64')
+            nbOf = (self.J - 1) * len(self.ispos)
+            Xis = Xis.reshape((P_N, self.J, nbOf)) # ERROR: UNEXPECTED ARGUMENT?
+
+        # }
+        else: # {
+            Xis = np.array([])
+        # }
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # For alternative specific variables
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Xas = None
+        if asvars_construct_matrix:
+        # {
+            Xas = X[:, self.aspos]
+            Xas = Xas.reshape(N, J, -1)
+        # }
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Set design matrix based on existence of asvars and isvars
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        """
+        NEW CODE:
+        if asvars_construct_matrix:     # There are vars that are not isvars
+            X = np.dstack((Xis, Xas)) if self.isvars else Xas
+        elif self.isvars:
+            X = Xis
+        else: # {
+            length = len(self.varnames)
+            if self.fit_intercept: length += (J - 1) - 1
+            X = X.reshape(-1, len(self.alts), length)
+        # }"""
+
+        # OLD CODE:
+        if len(asvars_construct_matrix) and len(self.isvars):
+            X = np.dstack((Xis, Xas))
+        elif len(asvars_construct_matrix):
+            X = Xas
+        elif (len(self.isvars)):
+            X = Xis
+        else:
+            x_varname_length = len(self.varnames)
+            X = X.reshape((-1, len(self.alts), x_varname_length))
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+        intercept_names = []
+
+        names = ["{}.{}".format(isvar, j) for isvar in isvars for j in self.alts if j != self.base_alt]
+
+        lambda_names_fixed = ["lambda.{}".format(transvar) for transvar in fixedtransvars]
+
+        lambda_names_rand = ["lambda.{}".format(transvar) for transvar in randtransvars]
+
+        randvars = [x for x in self.varnames if x in self.randvars]
+        randvars = np.array(randvars, dtype='<U64')
+
+        asvars_names = [x for x in asvars if (x not in self.randvars) and
+                        (x not in fixedtransvars) and (x not in randtransvars)]
+
+        chol = ["chol." + self.varnames[self.correlationpos[i]] + "." +
+                self.varnames[self.correlationpos[j]] for i
+                in range(self.correlationLength) for j in range(i + 1)]
+
+        br_w_names = []
+
+        # three cases for corr. varnames: no corr, corr list, corr Bool (All)
+        if not (self.correlated_vars is True or isinstance(self.correlated_vars, list)):
+            if hasattr(self, "rvidx"):  # avoid errors with multinomial logit
+                br_w_names = np.char.add("sd.", randvars)
+
+        if (isinstance(self.correlated_vars, list)):  # if not all r.v.s correlated
+        # {
+            sd_uncorrelated_pos = [lst.index(str) for str in self.varnames
+                    if str not in self.correlated_vars and str in randvars]
+            br_w_names = np.char.add("sd.", self.varnames[sd_uncorrelated_pos])
+        # }
+
+        sd_rand_trans = np.char.add("sd.", self.varnames[randtranspos])
+
+        names = np.concatenate((intercept_names, names, asvars_names, randvars,
+                                chol, br_w_names, fixedtransvars,
+                                lambda_names_fixed, randtransvars,
+                                sd_rand_trans, lambda_names_rand))
+
+        names = np.array(names, dtype="<U64")
+        return X, names
+    # }
+
+
+    def check_instance(self, obj):
+
+        if "MultinomialLogit" in obj.__class__.__name__:
+            
+            return True
+        elif "OrderedLogitLong" in obj.__class__.__name__:
+            return True
+        elif "MultinomialProbit" in obj.__class__.__name__:
+            return True
+        elif "NestedLogit" in obj.__class__.__name__:
+            return True
+        else:
+           
+            return False
+        #return isinstance(self, MultinomialLogit)
+
+    def restate_idx(self, ispos, isvar, asvars):
+        #todo check if i isvar and aasvars can both be present, otherwise not needed
+        if self.check_instance(self):
+
+
+            return
+        else:
+            
+            #I BELIEVE THIS IS REDUNDANT NOW
+
+            self.fxidx = np.delete(self.fxidx, ispos)
+
+            self.fxtransidx = np.delete(self.fxtransidx, ispos)
+            # self.fxtransidx = np.insert(np.array(self.fxtransidx, dtype="bool_"),
+            #  0, np.repeat(False, len(self.isvars)*(J - 1)))
+            if hasattr(self, 'rvidx'):
+                self.rvidx = np.delete(self.rvidx, ispos)
+            if hasattr(self, 'rvtransidx'):
+                self.rvtransidx = np.delete(self.rvtransidx, ispos)
+        
+               
+
+
+    def setup_design_matrix(self, X):
+        """Setups and reshapes input data after adding isvars and intercept.
+
+        Setup the design matrix by adding the intercept when necessary and
+        converting the isvars to a dummy representation that removes the base
+        alternative.
+        """
+
+        J = getattr(self, 'J', len(self.alts))
+        #print(X)
+        N = P_N = int(len(X)/J)
+        self.P = 0
+        self.N = N
+        self.J = J
+        if self.panels is not None:
+            # panels size
+            self.P_i = ((np.unique(self.panels, return_counts=True)[1])/J).astype(int)
+            self.P = np.max(self.P_i)
+            self.N = len(self.P_i)
+        else:
+            self.P = 1
+            self.P_i = np.ones([N]).astype(int)
+        isvars = self.isvars.copy()
+        asvars = self.asvars.copy()
+        asvars_construct_matrix = self.asvars_construct_matrix.copy()
+        randvars = self.randvars.copy()
+        randtransvars = self.randtransvars.copy()
+        fixedtransvars = self.fixedtransvars.copy()
+        varnames = self.varnames.copy()
+        self.varnames = np.array(varnames, dtype="<U64")
+        #print('varnames', varnames)
+        lst = varnames
+        lst = np.array(lst, dtype='<U64')
+
+        lst = lst.tolist()
+
+        ispos = [lst.index(str) for str in self.isvars if str in lst]  # Position of IS vars
+        #print(ispos)
+        #ispos = [self.varnames.tolist().index(i) for i in self.isvars]  # Position of IS vars
+
+        # adjust index array to include isvars
+        
+        if len(self.isvars) > 0 and not hasattr(self, 'ispos'):  # check not done before...
+            #self.fxidx = np.insert(np.array(self.fxidx, dtype="bool_"), 0,
+                                #   np.repeat(True, len(self.isvars)*(J - 1)))
+            where_h = ispos
+            where_h =0
+
+
+            self.restate_idx(ispos, isvars, asvars)
+            self.fxidx =np.insert(np.array(self.fxidx, dtype="bool_"), where_h, np.repeat(True, len(self.isvars)*(J-1)))
+            self.fxtransidx = np.insert(np.array(self.fxtransidx, dtype="bool_"), where_h, np.repeat(False, len(self.isvars)*(J - 1)))
+            #self.fxtransidx = np.insert(np.array(self.fxtransidx, dtype="bool_"),
+                                      #  0, np.repeat(False, len(self.isvars)*(J - 1)))
+            if hasattr(self, 'rvidx'):
+                self.rvidx = np.insert(np.array(self.rvidx, dtype="bool_"), where_h,
+                                       np.repeat(False, len(self.isvars)*(J -1)))
+            if hasattr(self, 'rvtransidx'):
+                self.rvtransidx = np.insert(np.array(self.rvtransidx, dtype="bool_"),
+                                            0, np.repeat(False, len(self.isvars)*(J - 1)))
+        else:
+            self.restate_idx(ispos, isvars, asvars)
+
+
+
+        if self.transformation == "boxcox":
+            self.trans_func = boxcox_transformation
+            self.transform_deriv = boxcox_param_deriv
+
+        S = np.zeros((self.N, self.P, self.J))
+        for i in range(self.N):
+            S[i, 0:self.P_i[i], :] = 1
+        self.S = S
+   
+        #ispos = [self.varnames.tolist().index(i) for i in self.isvars[self.isvars != '_inter']]  # Position of IS vars
+        aspos = [self.varnames.tolist().index(i) for i in asvars_construct_matrix]  # Position of AS vars
+        self.aspos = np.array(aspos) # saved for later use
+        self.ispos = np.array(ispos)
+
+        # **Add Validation for asvars**
+        '''
+        if asvars_construct_matrix:
+
+            for asvar in asvars_construct_matrix:
+                asvar_data = X[:, lst.index(asvar)].reshape(N, J)
+                if np.all(asvar_data == asvar_data[0, :]):  # Check if all rows are identical
+                    raise ValueError(
+                        f"Alternative-specific variable '{asvar}' has the same data "
+                        f"for all individuals across alternatives. This will prevent "
+                        f"capturing alternative-specific effects."
+                    )
+                '''
+
+
+
+
+        randpos = [self.varnames.tolist().index(i) for i in randvars]  # Position of AS vars
+        randtranspos = [self.varnames.tolist().index(i) for i in randtransvars]  # bc transformed variables with random coeffs
+        fixedtranspos = [self.varnames.tolist().index(i) for i in fixedtransvars]  # bc transformed variables with fixed coeffs
+
+
+        self.correlationpos = []
+        self.uncorrelatedpos = []
+        if randvars:
+            self.correlationpos = [lst.index(str) for str in self.varnames if
+                                   str in self.randvars]  # Position of correlated variables within randvars
+
+        if (isinstance(self.correlated_vars, list)):
+            # {
+            self.correlationpos = [lst.index(str) for str in self.varnames if str in self.correlated_vars]
+            self.uncorrelatedpos = [lst.index(str) for str in self.varnames if str not in self.correlated_vars and str in randvars]
+        # }
+
+        self.Kf = sum(self.fxidx)  # set number of fixed coeffs from idx
+        self.Kr = len(randpos)  # Number of random coefficients
+        self.Kftrans = len(fixedtranspos)  # Number of fixed coefficients of bc transformed vars
+        self.Krtrans = len(randtranspos)  # Number of random coefficients of bc transformed vars
+        self.Kchol = 0  # Number of random beta cholesky factors
+        self.correlationLength = 0
+        self.Kbw = self.Kr
+
+        # set up length of betas required to estimate correlation and/or
+        # random variable standard deviations, useful for cholesky matrix
+        if (self.correlated_vars):
+            if (isinstance(self.correlated_vars, list)):
+                nb_corvars = len([v for v in self.correlated_vars if v in randvars])
+                self.correlationLength = nb_corvars
+                self.Kbw = self.Kr - nb_corvars
+                self.Kchol = int((nb_corvars * (nb_corvars + 1)) / 2)
+            else:
+                self.correlationLength = self.Kr
+                self.Kbw = 0
+                nb_randvars = len(self.randvars)
+                self.Kchol = int((nb_randvars * (nb_randvars + 1)) / 2)
+
+
+        # Create design matrix
+        # For individual specific variables
+        Xis = None
+        if len(self.isvars) or len(self.ispos):
+            # {
+            # Create a dummy individual specific variables for the alts
+            dummy = np.tile(np.eye(J), reps=(P_N, 1))
+
+            # Remove base alternative
+            #print(self.alts)
+            dummy = np.delete(dummy, np.where(self.alts == self.base_alt)[0], axis=1)
+            Xis = X[:, self.ispos]
+
+            if Xis.dtype == np.object_:
+                Xis_numeric = pd.to_numeric(Xis.flatten(), errors='coerce').reshape(Xis.shape)
+                Xis = Xis_numeric
+
+            # Multiply dummy representation by the individual specific data
+            try:
+
+                Xis = np.einsum('nj,nk->njk', Xis, dummy, dtype="float64")
+            except:
+                Xis_numeric = pd.to_numeric(Xis.flatten(), errors='coerce').reshape(Xis.shape)
+                Xis = Xis_numeric
+                Xis = np.einsum('nj,nk->njk', Xis, dummy, dtype="float64")
+                # Example of filtering out non-numeric data
+                # Xis = np.array([x for x in Xis if isinstance(x, (int, float))], dtype='float64')
+            nbOf = (self.J - 1) * len(self.ispos)
+            try: #TODO this falls over for base alt
+                Xis = Xis.reshape((P_N, self.J, nbOf))  # ERROR: UNEXPECTED ARGUMENT?
+            except Exception as e:
+                nbOf = (self.J) * len(self.ispos)
+                Xis = Xis.reshape((P_N, self.J, nbOf))  # ERROR:TODO BASE ?
+
+
+        # }
+        else:  # {
+            Xis = np.array([])
+        # }
+        # For alternative specific variables
+        Xas = None
+        if asvars_construct_matrix:
+            Xas = X[:, aspos]
+            Xas = Xas.reshape(N, J, -1)
+
+        # Set design matrix based on existance of asvars and isvars
+        if len(asvars_construct_matrix) and len(self.isvars):
+            X = np.dstack((Xis, Xas))
+        elif len(asvars_construct_matrix):
+            X = Xas
+        elif (len(self.isvars)):
+            X = Xis
+        else:
+            x_varname_length = len(self.varnames)
+            X = X.reshape(-1, len(self.alts), x_varname_length)
+
+        intercept_names = [] #toddo remove
+
+        names = ["{}.{}".format(isvar, j) for isvar in isvars for j in self.alts if j != self.base_alt]
+
+        lambda_names_fixed = ["lambda.{}".format(transvar) for transvar in fixedtransvars]
+
+        lambda_names_rand = ["lambda.{}".format(transvar) for transvar in randtransvars]
+
+        randvars = [x for x in self.varnames if x in self.randvars]
+        randvars = np.array(randvars, dtype='<U64')
+
+        asvars_names = [x for x in asvars if (x not in self.randvars) and
+                        (x not in fixedtransvars) and (x not in randtransvars)]
+
+
+        chol = ["chol." + self.varnames[self.correlationpos[i]] + "." +
+                self.varnames[self.correlationpos[j]] for i
+                in range(self.correlationLength) for j in range(i + 1)]
+
+        br_w_names = []
+
+        # three cases for corr. varnames: no corr, corr list, corr Bool (All)
+        if not (self.correlated_vars is True or isinstance(self.correlated_vars, list)):
+            if hasattr(self, "rvidx"):  # avoid errors with multinomial logit
+                br_w_names = np.char.add("sd.", randvars)
+
+        if (isinstance(self.correlated_vars, list)):  # if not all r.v.s correlated
+            # {
+
+
+            names_for_p = self.varnames
+            sd_uncorrelated_pos = [lst.index(str) for str in names_for_p
+                                   if str not in self.correlated_vars and str in randvars]
+            br_w_names = np.char.add("sd.", names_for_p[sd_uncorrelated_pos])
+        # }
+
+        sd_rand_trans = np.char.add("sd.", self.varnames[randtranspos])
+        
+        #if isvars then isvars gets positionemed to fromt
+        if len(self.isvars) >0:
+            #print('ordered names. DEBUG PRINT')
+
+            inter_o = []
+
+            names_o = [isvar for isvar in isvars for j in self.alts if j != self.base_alt]
+            restvars = [var for var in self.varnames if var not in names_o and var not in inter_o]
+            self.ordered_varnames = names_o + restvars
+
+
+
+
+            
+        else:        
+            self.ordered_varnames = self.varnames
+        #np.insert(np.array(self.varnames, dtype="<U64"), 0, '_inter')
+
+       
+        names = np.concatenate((intercept_names, names, asvars_names, randvars,
+                                chol, br_w_names, fixedtransvars,
+                                lambda_names_fixed, randtransvars,
+                                sd_rand_trans, lambda_names_rand))
+
+        names = np.array(names, dtype="<U64")
+        return X, names
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Check data is in long format                     '''
+    ''' ---------------------------------------------------------- '''
+    def check_long_format_consistency(self, ids, alts, sorted_idx):
+    # {
+        alts = alts[sorted_idx]
+        uq_alt = np.unique(alts)
+
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # Unused code:
+        # expect_alt = np.tile(uq_alt, int(len(ids)/len(uq_alt)))
+        # if not np.array_equal(alts, expect_alt):
+        #     raise ValueError('inconsistent alts values in long format')
+        # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        _, obs_by_id = np.unique(ids, return_counts=True)
+
+        """ An error is raised if the array of alternative indexes is incomplete. """
+        if not np.all(obs_by_id / len(uq_alt)):  # Multiple of J
+            raise ValueError('inconsistent alts and ids values in long format')
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Check for data consistency.Set to lonf format    '''
+    ''' ---------------------------------------------------------- '''
+    def arrange_long_format(self, X, y, ids, alts, panels=None):
+    # {
+        if ids is not None:
+        # {
+            pnl = panels if panels is not None else np.ones(len(ids))
+            alts = alts.astype(str)
+            alts = alts if len(alts) == len(ids) else np.tile(alts, int(len(ids) / len(alts)))
+            cols = np.zeros(len(ids), dtype={'names': ['panels', 'ids', 'alts'], 'formats': ['<f4', '<f4', '<U64']})
+            cols['panels'], cols['ids'], cols['alts'] = pnl, ids, alts  # Record
+
+            # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            # Unused code:
+            # sorted_idx = np.argsort(cols, order=['panels', 'ids', 'alts'])
+            # X, y = X[sorted_idx], y[sorted_idx]
+            # if panels is not None: panels = panels[sorted_idx]
+            # self._check_long_format_consistency(ids, alts, sorted_idx)
+        # }
+        return X, y, panels
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Validate potential mistakes in the input data    '''
+    ''' ---------------------------------------------------------- '''
+    def validate_inputs(self, X, y, alts, varnames):
+    # {
+        if varnames is None:
+            raise ValueError('The parameter varnames is required')
+        if alts is None:
+            raise ValueError('The parameter alternatives is required')
+        if X.ndim != 2:
+            raise ValueError("X must be an array of two dimensions in long format")
+        if y.ndim != 1:
+            raise ValueError("y must be an array of one dimension in long format")
+        if len(varnames) != X.shape[1]:
+            raise ValueError("The length of varnames must match the number of columns in X")
+    # }
+
+    ''' ------------------------------------------------------------- '''
+    ''' Function. Regularization of the loglike                       '''
+    ''' Flag affects whether penalty is added or subtracted           '''
+    ''' ------------------------------------------------------------- '''
+    def regularize_loglik(self, betas, negative=False):
+    # {
+        penalty = self.reg_penalty * np.sum(np.square(betas))
+        return -penalty if negative else penalty
+    # }
+
+    ''' ------------------------------------------------------------- '''
+    ''' Function. L1 (lasso) regularization of the loglike            '''
+    ''' Matches MetaCount regularise_l1 (corrected: uses abs not sq)  '''
+    ''' ------------------------------------------------------------- '''
+    def regularize_l1_loglik(self, betas, negative=False):
+    # {
+        penalty = self.l1_penalty * np.sum(np.abs(betas))
+        return -penalty if negative else penalty
+    # }
+
+    def regularize_l1_grad(self, betas):
+        """Gradient of the L1 penalty w.r.t. betas: l1_penalty * sign(betas)."""
+        return self.l1_penalty * np.sign(betas)
+
+
+
+    ''' ---------------------------------------------------------- '''                                                                       
+    ''' Function. Compute the log-likelihood of the null model     '''
+    ''' |y| = #samples * #choices                                  '''
+    ''' ---------------------------------------------------------- '''
+    def get_loglik_null(self):  # {
+        factor = 1.0 / self.J
+        y_ = self.y * factor  # Scale each element by 1/J
+        lik = np.sum(y_, axis=1)  # Compute row sums => |lik| = #samples
+        lik =np.clip(lik, 0.00001, None)
+        y_ = np.clip(y_, 0.00001, None)
+        loglik = np.log(lik)  # Log each element
+        loglik = -2 * np.sum(loglik)  # Sum the elements => |loglik| = 1
+        return loglik
+    # }
+
+    '''Gets the estimated coefficients of the model.'''
+    def get_coeff(self):
+
+        if self.coeff_est is None:  # {
+            warnings.warn("The current model has not been yet estimated", UserWarning)
+            return
+        else:
+            return self.coeff_est
+# }
+
+    def summarise(self, file=None, dashboard=True):
+    # {
+        LINE = "-" * 90
+        LINE2 = "-" * 25
+        LINE3 = "=" * 90
+
+        def p(text=""):
+            print(text, file=file)
+
+        def section(title):
+            p(LINE)
+            p(f"  {title}")
+        
+        def to_set(attr):
+            val = getattr(self, attr, None)
+            if val is None:
+                return set()
+            if hasattr(val, '__len__') and len(val) == 0:
+                return set()
+            if isinstance(val, np.ndarray):
+                return set(val.tolist())
+            if isinstance(val, dict):
+                return set(val.keys())
+            return set(val)
+
+        is_latent_class = hasattr(self, 'n_classes') and hasattr(self, 'class_betas')
+
+        # ── Header ──────────────────────────────────────────────────────────
+        p(LINE)
+        # Model name + time
+        time_str = f"  Time: {self.estim_time_sec:.1f}s"
+        n_draws = getattr(self, 'n_draws', None)
+        if n_draws:
+            time_str += f"  |  Draws: {n_draws}"
+        p(f"  Model Summary: {self.descr}")
+        p(LINE2)
+        if time_str:
+            p(time_str)
+
+        # Sample info
+        N = getattr(self, 'N', None)
+        P = getattr(self, 'P', None)
+        if getattr(self, "panel_info", None) is not None:
+            obs = self.panel_info.sum(axis=1).astype(int)
+        else:            
+            obs = np.ones(self.N, dtype=int)   
+        mn, mx = int(obs.min()), int(obs.max())
+        if N is not None:
+            if P is not None and P > 1:
+                total = getattr(self, 'sample_size', N * P)
+                p(f"  Individuals: {N}  |  Choices per Individual: {mx if mn == mx else f'{mn}-{mx}'}  |  Total Choices: {total}")
+            else:
+                p(f"  Individuals: {N}")
+        # ── Multistarting ──────────────────────────────────────────────────
+        if is_latent_class and getattr(self, 'multistart_loglik', None):
+            p(LINE)
+            n_runs = len(self.multistart_loglik)
+            p(f"  Multistarting ({n_runs} runs)")
+            kinds = getattr(self, 'multistart_kind', ['random'] * n_runs)
+            kind_labels = {'memory': 'Memory', 'memory_jitter': 'Memory + Jitter', 'random': 'Random'}
+            w_kind = getattr(self, 'winner_kind', None)
+
+            # Label column width so [WINNER] doesn't shift the values.
+            labels = []
+            for kind_key in ('memory', 'memory_jitter', 'random'):
+                if not any(k == kind_key for k in kinds):
+                    continue
+                lab = kind_labels[kind_key]
+                if w_kind == kind_key:
+                    lab += " [WINNER]"
+                labels.append(lab)
+            lab_w = max((len(s) for s in labels), default=18)
+
+            for kind_key in ('memory', 'memory_jitter', 'random'):
+                vals = [round(ll, 2) for ll, k in zip(self.multistart_loglik, kinds) if k == kind_key]
+                if not vals:
+                    continue
+                counts = {}
+                for v in vals:
+                    counts[v] = counts.get(v, 0) + 1
+                ordered = sorted(counts.items(), key=lambda kv: -kv[0])
+                lab = kind_labels[kind_key]
+                if w_kind == kind_key:
+                    lab += " [WINNER]"
+                row = "  ".join(f"{v:.1f} (x{c})" for v, c in ordered)
+                p(f"  {lab:<{lab_w}}   {row}")
+
+        # Convergence diagnostics — latent class: always shown (step, delta_ll,
+        # Hessian condition number); other models: only shown on failure (old
+        # gtol/ftol behaviour, unchanged).
+        if is_latent_class:
+            p(LINE)
+            p("  Convergence Diagnostics" + ("" if self.converged else "  [NOT CONVERGED]"))
+            p(LINE2)
+            gc = getattr(self, 'final_grad_choice', [])
+            gm = getattr(self, 'final_grad_member', np.array([]))
+            grad_choice_max = max((np.max(np.abs(v)) for v in gc if v.size), default=float('nan'))
+            grad_member_max = np.max(np.abs(gm)) if gm.size else float('nan')
+            ll_ok = "OK" if abs(getattr(self, 'final_delta_ll', np.inf)) < self.ftol else "X"
+            gc_ok = "OK" if grad_choice_max < self.gtol else "X"
+            gm_ok = "OK" if grad_member_max < self.gtol else "X"
+            lbl_w = len("Membership Level:")            
+            p(f"  {'Log-likelihood':<{lbl_w}} ftol={self.ftol:<10.0e}|  Final ΔLL: {getattr(self, 'final_delta_ll', float('nan')):<10.2e}{ll_ok}")
+            p(f"  {'Choice Level:':<{lbl_w}} gtol={self.gtol:<10.0e}|  Grad Norm: {grad_choice_max:<10.2e}{gc_ok}")
+            p(f"  {'Membership Level:':<{lbl_w}} gtol={self.gtol:<10.0e}|  Grad Norm: {grad_member_max:<10.2e}{gm_ok}")
+            cr = getattr(self, 'class_ratio_min', None)
+            if cr is not None and np.isfinite(cr).any():
+                p()
+                p(f"  Hessian Condition Number (Worst Class): {1.0/np.nanmin(cr):.2e}")
+            if not self.converged:
+                p("  WARNING: Convergence was not reached. Estimates may not be reliable.")
+                stop = getattr(self, 'stop_reason', 'unknown')
+                p(f"  EM iterations: {self.total_iter}  (stopped: {stop})")
+                if gc_ok == "X":
+                    p("  Parameters not meeting grad tolerance (Choice):")
+                    coeff_class = np.concatenate([np.full(int(k), c) for c, k in enumerate(self._Ks)])
+                    idx = 0
+                    for c, v in enumerate(gc):
+                        for k in range(len(v)):
+                            if abs(v[k]) > self.gtol:
+                                p(f"    {self.coeff_names[idx]:<30}  grad = {v[k]:.4e}")
+                            idx += 1
+                if gm_ok == "X":
+                    p("  Parameters not meeting grad tolerance (Membership):")
+                    for k in range(len(gm)):
+                        if abs(gm[k]) > self.gtol and k < len(self.gamma_names):
+                            p(f"    {self.gamma_names[k]:<30}  grad = {gm[k]:.4e}")       
+        elif not self.converged:
+            p(LINE)
+            p("  WARNING: Convergence was not reached. Estimates may not be reliable.")
+            if hasattr(self, "gtol_res") and hasattr(self, "ftol_res"):
+                gtol_ok = "OK" if self.gtol_res < self.gtol else "X"
+                ftol_ok = "OK" if self.ftol_res < self.ftol else "X"
+                p(f"  gtol: {self.gtol}  |  Final gradient norm: {self.gtol_res:.2e}  {gtol_ok}")
+                p(f"  ftol: {self.ftol}  |  Final function value: {self.ftol_res:.2e}  {ftol_ok}")
+                if gtol_ok == "X" and hasattr(self, "grad_vector") and self.coeff_names is not None:
+                    failing = [(self.coeff_names[k], self.grad_vector[k])
+                            for k in range(len(self.coeff_names))
+                            if abs(self.grad_vector[k]) > self.gtol]
+                    if failing:
+                        p(f"  Parameters not meeting gtol threshold:")
+                        for name, gval in failing:
+                            p(f"    {name:<30}  grad = {gval:.4e}")
+
+        # ── Proportion of Alternatives ───────────────────────────────────────
+        if hasattr(self, 'pred_prob') and hasattr(self, 'obs_prob'):
+            p(LINE)
+            p("  Proportion of Alternatives")
+            p(LINE2)
+            alts = getattr(self, 'alts', [f"alt{i+1}" for i in range(len(self.obs_prob))])
+            label_w = 12
+            col_w   = 9
+            alt_header = " " * (label_w + 2) + "".join(f"{str(a):>{col_w}}" for a in alts)
+            obs_row    = f"  {'Observed:':<{label_w}}" + "".join(f"{v:>{col_w}.3f}" for v in self.obs_prob)
+            pred_row   = f"  {'Predicted:':<{label_w}}" + "".join(f"{v:>{col_w}.3f}" for v in self.pred_prob)
+            p(alt_header)
+            p("  " + "-" * (label_w + len(alts) * col_w))
+            p(obs_row)
+            p(pred_row)
+
+        if is_latent_class:
+            p(LINE)
+            p("  Estimated Proportion of Classes")
+            p(LINE2)
+            se_pi = getattr(self, 'se_pi', None)
+            ci_lo = getattr(self, 'ci_lo_pi', None)
+            ci_hi = getattr(self, 'ci_hi_pi', None)
+            if (se_pi is not None and ci_lo is not None and ci_hi is not None
+                    and len(se_pi) == len(self.class_probs)):
+                base_c = getattr(self, 'base_class', self.n_classes - 1)
+                p(f"  {'Class':<10}{'Share':>9}{'SE':>9}{'95% CI':>20}")
+                p(f"  {'-'*10}{'-'*9}{'-'*9}{'-'*20}")
+                for c in range(self.n_classes):
+                    label = f"{c+1} (Base)" if c == base_c else f"{c+1}"
+                    ci = f"[{float(ci_lo[c]):.4f}, {float(ci_hi[c]):.4f}]"
+                    p(f"  {label:<10}{float(self.class_probs[c]):>9.4f}"
+                      f"{float(se_pi[c]):>9.4f}{ci:>20}")
+                p(LINE2)
+                p("  95% C.I computed on the logit scale (Bounded in [0, 1])")
+            else:
+                p(f"  {np.round(self.class_probs, 3)}")
+        elif hasattr(self, 'class_freq'):
+            p(LINE)
+            p("  Estimated Proportion of Classes")
+            p(f"  {np.round(self.class_freq, 3)}")
+            
+        if is_latent_class and getattr(self, "entropy", None) is not None:
+            p(LINE)
+            p("  Classification Quality")
+            p(LINE2)
+            e = self.entropy
+            if e >= 0.8:
+                e_tag = ""
+            elif e >= 0.6:
+                e_tag = "  [MODERATE]"
+            else:
+                e_tag = "  [POOR]"
+            p(f"    Entropy: {e:.4f}  {e_tag}")
+            occ = getattr(self, "occ", None)
+            if occ is not None:
+                any_flag = any(
+                    np.isfinite(occ[c]) and occ[c] < 10
+                    for c in range(self.n_classes)
+                )
+                if any_flag:
+                    p(f"    {'Class':<12}{'OCC':>10}   Verdict")
+                    p(f"    {'-'*12}{'-'*10}   {'-'*10}")
+                else:
+                    p(f"    {'Class':<12}{'OCC':>10}")
+                    p(f"    {'-'*12}{'-'*10}")
+                for c in range(self.n_classes):
+                    base_tag = " (Base)" if c == self.base_class else ""
+                    label = f"{c+1}{base_tag}"
+                    v = occ[c]
+                    v_str = "nan" if not np.isfinite(v) else f"{v:.2f}"
+                    if not np.isfinite(v):
+                        verdict = ""
+                    elif v < 5:
+                        verdict = "[POOR]"
+                    elif v < 10:
+                        verdict = "[MODERATE]"
+                    else:
+                        verdict = ""
+                    if verdict:
+                        p(f"    {label:<12}{v_str:>10}   {verdict}")
+                    else:
+                        p(f"    {label:<12}{v_str:>10}")
+
+        # ── Coefficient classification ───────────────────────────────────────
+        if self.coeff_est is None:
+            p(LINE)
+            p("  Model has not been estimated.")
+            return
+
+        # ── Shared table format (both branches) ───────────────────────────────
+        sig_map = {0.001: "(***)", 0.01: "(**)", 0.05: "(*)", 0.1: "(.)", 1.01: "(-)"}
+        fmt = "  {:<16} {:<14} {:>12.4f} {:>12.4f} {:>10.3f} {:>10.3f} {:<4}"
+        hdr = "  {:<16} {:<16} {:>16} {:>17} {:>8} {:>11}".format(
+            "Variable", "Distribution", "Coefficient", "Standard Error", "t-stat", "p-val")
+        
+        # LC branch: no Distribution column
+        fmt_lc = "  {:<22} {:>14.4f} {:>14.4f} {:>12.3f} {:>12.3f} {:<4}"
+        hdr_lc = "  {:<22} {:>16} {:>17} {:>8} {:>11}".format(
+            "Variable", "Coefficient", "Standard Error", "t-stat", "p-val")
+
+        def sig(pv):
+            try:
+                return next(s for thr, s in sig_map.items() if pv < thr)
+            except StopIteration:
+                return ""
+            
+        fs = getattr(self, 'firth_summary', None)
+        show_diag = bool(fs.get('needed_correction', False)) if isinstance(fs, dict) else False
+        show_diag = True 
+        def vp_str(share_arr, idx):
+            if not show_diag or share_arr is None or idx >= len(share_arr) or not np.isfinite(share_arr[idx]):
+                return ""
+            if share_arr[idx] <= 0.5:
+                return ""
+            return f"  VP={share_arr[idx]:>5.2f}"
+        
+        OPG_HESS_SHOW = 3.0 
+        def opg_str(idx):
+            opg = getattr(self, 'opg_se', None)
+            if opg is None or idx >= len(opg):
+                return ""
+            v = opg[idx]
+            if not np.isfinite(v) or v <= 0:
+                return ""
+            if se is None or idx >= len(se) or se[idx] <= 0:
+                return ""
+            ratio = v / se[idx]
+            if ratio <= OPG_HESS_SHOW:
+                return ""
+            return f"  (OPG={v:.4f}, x{ratio:.1f})"
+        def gamma_opg_str(gi):
+            opg = getattr(self, 'gamma_opg_se', None)
+            if opg is None or gi >= len(opg):
+                return ""
+            v = opg[gi]
+            if not np.isfinite(v) or v <= 0:
+                return ""
+            gse = getattr(self, 'gamma_se', None)
+            if gse is None or gi >= len(gse) or gse[gi] <= 0:
+                return ""
+            ratio = v / gse[gi]
+            if ratio <= OPG_HESS_SHOW:
+                return ""
+            return f"  (OPG={v:.4f}, x{ratio:.1f})"
+
+        def id_tag(flag_arr, idx):
+            if not show_diag or flag_arr is None or idx >= len(flag_arr):
+                return ""
+            return "  [NEAR-UNIDENTIFIED]" if flag_arr[idx] else ""
+        
+        def nonpd_tag(idx, attr='nonpd_flag'):
+            flags = getattr(self, attr, None)
+            if flags is None or idx >= len(flags):
+                return ""
+            return "  [NON-PD]" if flags[idx] else ""
+        
+        def hde_tag(idx, attr='hde_flag'):
+            flags = getattr(self, attr, None)
+            if flags is None or idx >= len(flags):
+                return ""
+            return "  [HDE]" if flags[idx] else ""
+
+        # ══════════════════════════════════════════════════════════════════
+        # LATENT CLASS BRANCH 
+        # ══════════════════════════════════════════════════════════════════
+        if is_latent_class:
+            C  = self.n_classes
+            Km = getattr(self, 'K_membership', 0)
+
+            se_error = getattr(self, 'se_computation_error', None)
+            if se_error is not None:
+                p(f"  [WARNING] Standard errors could not be computed: {se_error}")
+
+            if se_error is not None or self.pvalues is None:
+                p("  Class Shares:")
+                for idx, share in enumerate(self.class_probs, start=1):
+                    p(f"    class_{idx}: {share:.6f}")
+                p("  Coefficients:")
+                for c_idx, beta in enumerate(self.class_betas, start=1):
+                    idx = self._class_specs[c_idx - 1] if self._class_specs is not None else range(len(beta))
+                    for k, value in zip(idx, beta):
+                        name = self.varnames[k]
+                        p(f"    class_{c_idx}_{name}: {value:.6f}")
+                
+                if self.class_gammas is not None and self._has_membership and self.optimise_membership:
+                    gammas_arr = np.asarray(self.class_gammas)
+                    p("  Membership Parameters:")
+                    for c in range(self.n_classes - 1):
+                        for k in range(gammas_arr.shape[1]):
+                            label = f"gamma_{c + 1}_{self.membership_vars[k]}"
+                            p(f"    {label}: {gammas_arr[c, k]:.6f}")
+                            p(f"    class_{c_idx}_{name}: {value:.6f}")
+
+                if self.class_gammas is not None and self._has_membership and self.optimise_membership:
+                    Km = self.K_membership
+                    n_inter = len(self._intercept_free_classes)
+                    class_intercepts = self.class_gammas[:n_inter]
+                    gamma_covariates = self.class_gammas[n_inter:].reshape(self.n_classes, Km)
+                    p("  Membership Parameters:")
+                    for i, c in enumerate(self._intercept_free_classes):
+                        p(f"    gamma_intercept_class_{c + 1}: {class_intercepts[i]:.6f}")
+                    for c in range(self.n_classes):
+                        for k in range(Km):
+                            if self._member_mask[c, k] > 0:
+                                label = f"gamma_class_{c + 1}_{self.membership_vars[k]}"
+                                p(f"    {label}: {gamma_covariates[c, k]:.6f}")
+                return
+
+            params   = self.se_params
+            se       = self.stderr
+            t_stats  = self.zvalues
+            p_values = self.pvalues
+            n_phi    = C - 1
+            has_gamma = self.gamma_params is not None and len(self.gamma_params) > 0
+
+            p(LINE3)
+            p(hdr_lc)
+
+            offset_cum = n_phi
+            shares_by_class = self.class_specific_choice_shares() 
+            # Conditional models append one extra column (purchase rate) to
+            # class_specific_choice_shares(); base LC returns exactly J.
+            has_purchase = hasattr(self, 'w') and shares_by_class.shape[1] > len(self.alts)
+            # Base class label: use the model's own base_class when available
+            # (0-indexed internally). Fall back to the last class for models
+            # that don't expose the attribute — this preserves the old default.
+            _base_c = getattr(self, 'base_class', C - 1)
+
+            nonpd = getattr(self, 'nonpd_flag', None)
+            n_nonpd = int(np.sum(nonpd[C - 1:])) if nonpd is not None else 0
+            n_hde = (int(np.sum(getattr(self, 'hde_flag', [])))
+                     + int(np.sum(getattr(self, 'gamma_hde_flag', []))))
+            if n_nonpd:
+                p(f"  WARNING: Hessian not positive definite: {n_nonpd} parameter(s) with "
+                  f"non-positive variance (min eigenvalue = "
+                  f"{getattr(self, 'hess_min_eig', float('nan')):.2e})")
+                
+            for c in range(C):
+                K_c = self._Ks[c]
+                is_base = (c == _base_c)
+                if c > 0:
+                    p("")
+                label = f"CLASS {c + 1}   (Share = {self.class_probs[c]:.2%})"
+                alt_shares = "  (" + " / ".join(
+                    f"{a}: {shares_by_class[c, j]:.2%}" for j, a in enumerate(self.alts)
+                ) + ")"
+                label += alt_shares
+                if has_purchase:
+                    label += f"  | Purchase: {shares_by_class[c, len(self.alts)]:.2%}"
+                if is_base:
+                    label += "   (Base)"
+                section(label)
+                p(LINE)
+
+                cr = getattr(self, 'class_ratio_min', None)
+                if show_diag and cr is not None and c < len(cr) and np.isfinite(cr[c]):
+                    abs_f = getattr(self, 'class_ratio_min_abs_flag', [False]*C)[c]
+                    rel_f = getattr(self, 'class_ratio_min_rel_flag', [False]*C)[c]
+                    if abs_f or rel_f:
+                        crit = ("abs" if abs_f else "") + ("+rel" if rel_f else "")
+                        p(f"  ratio_min={cr[c]:.2e}  [{crit}]")
+
+                p("  Class Parameters")
+                p(LINE2)
+                idx = self._class_specs[c]
+                for k in range(K_c):
+                    vname = self.varnames[idx[k]].replace("intercept.", "ASC_", 1)
+                    pi = offset_cum + k
+
+                    row_vp = vp_str(getattr(self, 'collin_share', None), pi)
+                    row_tag = id_tag(getattr(self, 'collin_flag', None), pi)
+                    p(fmt_lc.format(vname[:22], params[pi], se[pi], t_stats[pi], p_values[pi], sig(p_values[pi])) + row_vp + opg_str(pi) + row_tag + nonpd_tag(pi) + hde_tag(pi))
+                    #p(fmt.format(vname[:16], "", params[pi], se[pi], t_stats[pi], p_values[pi], sig(p_values[pi])) + row_vp + row_tag)
+                offset_cum += K_c
+            
+                if has_gamma:
+                    p("")
+                    p("  Membership Parameters")
+                    p(LINE2)
+                    is_base_c = (c == self.base_class)
+                    inter_tag = f"gamma_intercept_class_{c + 1}"
+                    var_tag = f"gamma_class_{c + 1}_"
+                    n_phi = self.n_classes - 1
+                    gamma_start = n_phi + sum(self._Ks)
+                    printed_any = False
+                    for gi, gname in enumerate(self.gamma_names):
+                        if gname == inter_tag:
+                            var_name = f"Inter_C{c + 1}"
+                        elif gname.startswith(var_tag):
+                            var_name = gname[len(var_tag):]
+                        else:
+                            continue
+                        printed_any = True
+                        row_vp = vp_str(getattr(self, 'gamma_collin_share', None), gi)
+                        row_tag = id_tag(getattr(self, 'gamma_collin_flag', None), gi)
+                        p(fmt_lc.format(var_name[:22], self.gamma_params[gi], self.gamma_se[gi],
+                                self.gamma_t_stats[gi], self.gamma_p_values[gi],
+                                sig(self.gamma_p_values[gi])) + row_vp + gamma_opg_str(gi) + row_tag + nonpd_tag(gi, 'gamma_nonpd_flag') + hde_tag(gi, 'gamma_hde_flag'))
+                    if not printed_any and is_base_c:
+                        p("  (Base)")
+                        #p(fmt.format(var_name[:16], "", self.gamma_params[gi], self.gamma_se[gi],
+                         #           self.gamma_t_stats[gi], self.gamma_p_values[gi],
+                          #          sig(self.gamma_p_values[gi])) + row_vp + row_tag)
+            p()
+            section("GOODNESS OF FIT")
+            p(LINE3)
+            
+            loglik_null = self.get_loglik_null()
+            adjlik = 1 - ((self.loglik - self.num_params) / loglik_null)
+            self.adjust_lik_ratio = adjlik
+
+            p("  In-Sample")
+            p(f"  LOGLIK = {self.loglik:.0f}  |  AIC = {self.aic:.0f}  |  BIC = {self.bic:.0f}  |  McFadden Adj.R²: = {adjlik:.3f}")
+            mae = getattr(self, 'mae', None)
+            if mae is not None:
+                p("")
+                p("  Out-of-Sample")
+                p(f"  MAE = {mae:.4f}")
+
+            p(LINE)
+            p("  Significance:  0 '(***)' 0.001 '(**)' 0.01 '(*)' 0.05 '(.)' 0.1 '(-)' 1")
+            p("  (two-sided)")
+            if n_nonpd:
+                p("  [NON-PD]: non-positive Hessian variance; S.E. clipped to 0")
+            if n_hde:
+                p("  [HDE]: Hauck-Donner effect; Wald z unreliable (near-separation)")
+            p(LINE)
+            if hasattr(self, "summarise_wald"):
+                try:
+                    self.summarise_wald(file=file)
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"[WALD ERROR] {exc}", file=file)
+            return
+
+        # ══════════════════════════════════════════════════════════════════
+        #  MNL / MXL 
+        # ══════════════════════════════════════════════════════════════════
+        randvars_dict     = getattr(self, 'randvarsdict', None) or {}
+        if isinstance(randvars_dict, np.ndarray):
+            randvars_dict = {}
+        transvars_set     = to_set('transvars')
+        randtransvars_set = to_set('randtransvars')
+        randvars_set      = set(randvars_dict.keys())
+
+        # Build ordered output: group coefficients by type
+        # Each group is a list of (display_name, coeff_idx)
+        intercept_rows   = []
+        fixed_rows       = []
+        random_rows      = []   # mean + sd paired
+        trans_rows       = []   # var + lambda paired
+        rand_trans_rows  = []   # mean + sd + lambda grouped
+
+        # Track which indices have been assigned
+        assigned = set()
+
+        # Helper: find sd. index for a variable
+        def find_sd(var):
+            for i, n in enumerate(self.coeff_names):
+                if n == f"sd.{var}":
+                    return i
+            
+            for i, n in enumerate(self.coeff_names):
+                if n == f"chol.{var}.{var}":
+                    return i
+            return None
+
+        # Helper: find lambda. index for a variable
+        def find_lambda(var):
+            for i, n in enumerate(self.coeff_names):
+                if n == f"lambda.{var}":
+                    return i
+            return None
+
+        for i, name in enumerate(self.coeff_names):
+            if i in assigned:
+                continue
+
+            # Intercepts
+            if 'intercept' in name.lower():
+                intercept_rows.append((name, "", i))
+                assigned.add(i)
+
+            # chol. => belongs to random section, added later with its variable
+            elif name.startswith('chol.'):
+                pass  # handled separately in correlation matrix
+
+            # sd. of random variable => handled when processing the mean
+            elif name.startswith('sd.'):
+                pass  # handled with mean
+
+            # lambda. of fixed transformed => handled with its variable
+            elif name.startswith('lambda.'):
+                pass
+
+            # Random transformed variable mean
+            elif name in randtransvars_set:
+                distr = randvars_dict.get(name, '')
+                row = [(name, distr, i)]
+                assigned.add(i)
+                sd_i = find_sd(name)
+                if sd_i is not None:
+                    row.append((f"sd.{name}", "", sd_i))
+                    assigned.add(sd_i)
+                lm_i = find_lambda(name)
+                if lm_i is not None:
+                    row.append((f"lambda.{name}", "", lm_i))
+                    assigned.add(lm_i)
+                rand_trans_rows.extend(row)
+
+            # Random variable mean
+            elif name in randvars_set:
+                distr = randvars_dict.get(name, '')
+                random_rows.append((name, distr, i))
+                assigned.add(i)
+                sd_i = find_sd(name)
+                if sd_i is not None:
+                    random_rows.append((f"sd.{name}", "", sd_i))
+                    assigned.add(sd_i)
+
+            # Fixed transformed variable
+            elif name in transvars_set:
+                trans_rows.append((name, "", i))
+                assigned.add(i)
+                lm_i = find_lambda(name)
+                if lm_i is not None:
+                    trans_rows.append((f"lambda.{name}", "", lm_i))
+                    assigned.add(lm_i)
+
+            # Fixed
+            else:
+                fixed_rows.append((name, "", i))
+                assigned.add(i)
+                
+        for i, name in enumerate(self.coeff_names):
+            if name.startswith('chol.'):
+                assigned.add(i)
+
+        p(LINE)
+        p(hdr)
+
+        def print_rows(title, rows):
+            if not rows:
+                return
+            section(title)
+            p(LINE2)
+            for name, distr, idx in rows:
+                signif = sig(self.pvalues[idx])
+                active = getattr(self, 'active_bounds', {}).get(idx)
+                bound_flag = " (A.B)" if active else ""
+                p(fmt.format(
+                    name[:16],
+                    distr,
+                    #self.coeff_est[idx],
+                    abs(self.coeff_est[idx]) if name.startswith('sd.') or (name.startswith('chol.') and name.split('.')[1] == name.split('.')[2]) else self.coeff_est[idx],
+                    self.stderr[idx],
+                    self.zvalues[idx],
+                    self.pvalues[idx],
+                    signif + bound_flag
+                ))
+        print_rows("INTERCEPTS",              intercept_rows)
+        print_rows("FIXED PARAMETERS",        fixed_rows)
+        print_rows("RANDOM PARAMETERS",       random_rows)
+        print_rows("TRANSFORMED PARAMETERS",  trans_rows)
+        print_rows("RANDOM TRANSFORMED PARAMETERS", rand_trans_rows)
+
+        # ── Correlation Matrix ───────────────────────────────────────────────
+        corr_mat = getattr(self, 'corr_mat', None)
+        corr_pos = getattr(self, 'correlationpos', [])
+        has_correlation = (
+            corr_mat is not None and
+            len(corr_pos) >= 2 and
+            getattr(self, 'Kchol', 0) > 0 and
+            getattr(self, 'correlationLength', 0) >= 2 )
+        
+        if has_correlation:
+            section("CORRELATION MATRIX")
+            p(LINE)
+            corr_names = [str(self.varnames[p_]) for p_ in corr_pos]
+            K = len(corr_names)
+
+            sig_map_corr = {0.001: " (***)", 0.01: " (**)", 0.05: " (*)", 0.1: " (.)", 1.01: " (-)"}
+            chol_pval = {}
+            for ii in range(K):
+                for jj in range(ii):
+                    key = f"chol.{corr_names[ii]}.{corr_names[jj]}"
+                    for ci, cn in enumerate(self.coeff_names):
+                        if cn == key:
+                            chol_pval[(ii, jj)] = self.pvalues[ci]
+                            break
+
+            p("  " + " " * 14 + "".join(f"{n:>14}" for n in corr_names))
+            for i in range(K):
+                row_str = f"  {corr_names[i]:<14}"
+                for j in range(K):
+                    if j < i:
+                        val = corr_mat[i, j]
+                        pv  = chol_pval.get((i, j), 1.0)
+                        sigc = next(s for thr, s in sig_map_corr.items() if pv < thr)
+                        row_str += f"{val:>8.3f}{sigc:<6}"
+                    elif j == i:
+                        row_str += f"{'1.000':>8}    "
+                    else:
+                        row_str += " " * 12
+                p(row_str)
+
+        # ── Goodness of Fit ──────────────────────────────────────────────────
+        section("GOODNESS OF FIT")
+        p(LINE)
+        
+        loglik_null = self.get_loglik_null()
+        adjlik = 1 - ((self.loglik - self.num_params) / loglik_null)
+        self.adjust_lik_ratio = adjlik
+        
+        
+        p("  In-Sample")
+        p(f"  LOGLIK = {self.loglik:.0f}  |  AIC = {self.aic:.0f}  |  BIC = {self.bic:.0f}  |  McFadden Adj.R²: = {adjlik:.3f}")
+        
+        if self.mae is not None:
+            p("")
+            p("  Out-of-Sample")
+            p(f"  MAE = {self.mae:.4f}")
+
+        p(LINE)
+        p("  Significance:  0 '(***)' 0.001 '(**)' 0.01 '(*)' 0.05 '(.)' 0.1 '(-)' 1")
+        p("  (two-sided)")
+        p(LINE)
+        #if file is None and dashboard:         
+            #generate_est_dashboard(model=self)
+    # }
+
+    def _firth_tag(self, se_raw, se_pen, idx, correction_active, ratio_threshold=3.0):
+        """Marker for summarise(): SE from the raw (unpenalized) Fisher
+        info vs. the SE actually reported, in both regimes (score_z branch
+        removed — verified empirically inert regardless of separation).
+        info_raw stays near-singular along a separating direction even at
+        a correction-active optimum, so this ratio discriminates whether
+        correction is on or off. `correction_active` only picks the label."""
+        if se_raw is None or idx >= len(se_raw):           
+            return ""
+        raw = se_raw[idx]
+        pen = se_pen[idx] if se_pen is not None and idx < len(se_pen) else float('nan')
+        ratio = raw / pen if (np.isfinite(raw) and np.isfinite(pen) and pen > 0) else float('nan')        
+        if not np.isfinite(raw) or not np.isfinite(pen) or pen <= 0:
+            return ""
+        if ratio <= ratio_threshold:
+            return ""
+        return "  [Firth]" if correction_active else "  [SEPARATED]"
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Print the coefficients and estimation outputs    '''
+    ''' ---------------------------------------------------------- '''
+    def summarise_alt(self, file=None):
+    # {
+        print("", file=file)
+        print(f"Choice Model: {self.descr}", file=file)
+
+        if self.coeff_est is None: # {
+            warnings.warn("The current model has not been yet estimated", UserWarning)
+            return
+        # }
+
+        if not self.converged: # {
+            print("-" * 50, file=file)
+            print("WARNING: Convergence was not reached during estimation. "
+                  "The given estimates may not be reliable", file=file)
+            if hasattr(self, "gtol_res"):
+                print("gtol:", self.gtol, file=file)
+                print("Final gradient norm:", self.gtol_res, file=file)
+            print('*' * 50, file=file)
+        # }
+
+        print("Estimation time= {:.1f} seconds".format(self.estim_time_sec), file=file)
+
+        if hasattr(self, 'pred_prob'):
+        # {
+            print("", file=file)
+            print("Proportion of alternatives: observed choice", file=file)
+            print(self.obs_prob, file=file)
+
+            # CONCEPTUAL ERROR: obs_prob is not defined
+
+            print("", file=file)
+            print("Proportion of alternatives: predicted choice", file=file)
+            print(self.pred_prob, file=file)
+        # }
+
+        if hasattr(self, 'class_freq'): # {
+            print("", file=file)
+            print("Estimated proportion of classes", file=file)
+            print(self.class_freq, file=file)
+        # }
+
+        print("", file=file)
+        print("Table.", file=file)
+        COL_NAME = 32
+        fmt = f"{{:{COL_NAME}}} {{:13.6f}} {{:13.6f}} {{:10.4f}} {{:11.4g}} {{:3}}"
+        SEP = "-" * (COL_NAME + 13 + 13 + 10 + 11 + 8)
+
+        print(SEP, file=file)
+        print(f"{'Coefficient':{COL_NAME}} {'Estimate':>13} {'Std.Err.':>13} {'z-val':>10} {'P>|z|':>11}",
+              file=file)
+        print(SEP, file=file)
+
+        significance_symbols = {0.001: "***", 0.01: "**", 0.05: "*", 0.1: ".", 1.01: ""}
+
+        pvalues  = self.pvalues  if self.pvalues  is not None else [float("nan")] * len(self.coeff_est)
+        stderr   = self.stderr   if self.stderr   is not None else [float("nan")] * len(self.coeff_est)
+        zvalues  = self.zvalues  if self.zvalues  is not None else [float("nan")] * len(self.coeff_est)
+
+        for i, coeff in enumerate(self.coeff_est):
+            pv = float(pvalues[i])
+            signif = next(
+                (sym for thr, sym in significance_symbols.items() if pv < thr),
+                ""
+            )
+            name = str(self.coeff_names[i])[:COL_NAME]
+            se   = float(stderr[i])
+            zv   = float(zvalues[i])
+            print(fmt.format(name, float(coeff), se, zv, pv, signif), file=file)
+
+        print(SEP, file=file)
+        print("Significance:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1", file=file)
+        print("", file=file)
+
+        text = f"LOGLIK = {self.loglik:0.3f}; AIC = {self.aic:0.3f}; BIC = {self.bic:0.3f};"
+
+        if self.mae is not None:
+            text += f"MAE= {self.mae:0.3f};"
+
+        loglik_null = self.get_loglik_null()
+        mcfadden_adj_r2 = 1 - (self.aic / loglik_null)   # equiv. 1-(LL-k)/LL_null
+        self.adjust_lik_ratio = mcfadden_adj_r2
+
+        text += f" McFadden Adj.R²: {mcfadden_adj_r2:.4f}"
+        print(text, file=file)
+    # }
+
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def print_matrix(self, str_mat, descr): # {
+        print(descr)
+        fmt = "{:11}"
+        for row in str_mat:
+            for el in row: print(fmt.format(el), end='  ')
+            print('')
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function.                                                  '''
+    ''' ---------------------------------------------------------- '''
+    def setup_print(self, mat):
+    # {
+        corr_varnames = [self.varnames[pos] for pos in self.correlationpos]
+        K = len(corr_varnames)
+        str_mat = np.array([], dtype="<U64")
+        str_mat = np.append(str_mat, np.array([''] + corr_varnames))  # top row of coeff names
+        mat = np.round(mat[0:K, 0:K], 8)
+
+        # ____________________________________________________
+        if dev.using_gpu: mat = dev.convert_array_cpu(mat)
+        # ____________________________________________________
+
+        for ii, row in enumerate(mat): # {
+            str_mat = np.append(str_mat, corr_varnames[ii])
+            str_mat = np.append(str_mat, np.array(row))
+        # }
+        str_mat = str_mat.reshape((K + 1, K + 1))  # + 1 for coeff names row/col
+        return str_mat
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Print  matrix                                    '''
+    ''' ---------------------------------------------------------- '''
+    def print_mat(self, mat, descr): # {
+        str_mat = self.setup_print(mat)
+        self.print_matrix(str_mat, descr)
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Return fitted values                             '''
+    ''' ---------------------------------------------------------- '''
+    def fitted(self, type="parameters"): # {
+        if type == "parameters" and hasattr(self, 'pch2_res'):
+            return self.pch2_res
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function                                                   '''
+    ''' ---------------------------------------------------------- '''
+    def print_stdev(self, stdevs, names): # {
+        fmt = "{:11}"
+        print('Standard Deviations')
+        for name in names: print(fmt.format(name), end='  ')
+        print('')
+        for std in stdevs: print(fmt.format(std), end='  ')
+        print('')
+    # }
+
+    ''' ---------------------------------------------------------- '''
+    ''' Function. Print standard deviations for randvars           '''
+    ''' ---------------------------------------------------------- '''
+    def compute_stddev(self):
+    # {
+        # CONCEPTUAL ERROR: covariance_matrix is undefined - it is a member of class mixed_logit
+        diags = np.diag(self.covariance_matrix)  # Grab the diagonals of the covariance_matrix matrix
+        diags = np.sqrt(diags)
+        diags = np.round(diags, 8)
+
+        # CHECK: self.covariance_matrix = [0:n, 0:n] where n = len(corr_varnames)
+
+        ''' QUERY: CAN THESE OPERATIONS BE DONE ONCE ON CLASS INITIALISATION? WHY DO THIS OVER AND OVER?'''
+        self.corr_varnames = [self.varnames[pos] for pos in self.correlationpos]
+        self.rv_names_noncorr = list(set(self.varnames) & set(self.randvars) - set(self.corr_varnames))
+        self.rvtrans_names = list(set(self.varnames) & set(self.randtransvars))
+        self.rv_names_all = self.corr_varnames + self.rv_names_noncorr + self.rvtrans_names
+
+        # ERROR: randvarsdict is undefined!
+        self.distributions_corr = [self.randvarsdict[name] for name in self.corr_varnames]
+        self.distributions_rv = [self.randvarsdict[name] for name in self.rv_names_noncorr]
+        self.distributions_rvtrans = [self.randvarsdict[name] for name in self.rvtrans_names]
+        self.distributions = self.distributions_corr + self.distributions_rv + self.distributions_rvtrans
+
+        stdevs = np.zeros(len(diags))  # Initialise an array of length len(diags) with zero
+
+        # CONCEPTUAL ERROR: betas is undefined - from multinomial_logit.py and mixed_logit.py
+        means = self.betas[self.Kf: self.Kf + self.Kr]
+        for ii, val in enumerate(diags):
+        # {
+            distr = self.distributions[ii]
+            if distr in ('n', 't'):
+                stdev = val
+            elif distr == 'ln':
+                stdev = np.sqrt(np.exp(val ** 2) - 1) * np.exp(means[ii] + 0.5 * val ** 2)
+            elif distr == 'u':
+                stdev = (val ** 2) / 3
+            else:
+                stdev = -1  # ERROR NO DISTRIBUTION CHOSEN
+            stdevs[ii] = np.round(stdev, 8)
+        # }
+
+        self.print_stdev(stdevs, self.rv_names_all)
+    # }
+# }
