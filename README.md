@@ -30,14 +30,10 @@ All dependencies are declared in `pyproject.toml` and installed automatically.
 ```bash
 git clone https://github.com/M-Fernando-Ing/Extensive-Hypothesis-Testing-for-Latent-Class-Models.git
 cd Extensive-Hypothesis-Testing-for-Latent-Class-Models
-
-conda create -n Searchlibrium python=3.11 -y
-conda activate Searchlibrium
-conda env config vars set PYTHONNOUSERSITE=1
-conda deactivate && conda activate Searchlibrium
-
-pip install -e .
+bash install.sh
 ```
+
+Run `bash install.sh --help` for options (custom environment name, venv instead of conda, HPC temp directory).
 
 ### Notes
 
